@@ -258,19 +258,31 @@ class DataProcessor(MMBaseDataProcessor):
         }
 
         # Define placeholders and their lengths
-        IMAGE_PLACEHOLDER = "<|image_pad|>"
-        VIDEO_PLACEHOLDER = "<|video_pad|>"
+        IMAGE_PLACEHOLDER = self.image_token
+        VIDEO_PLACEHOLDER = self.video_token
         IMAGE_PLACEHOLDER_LEN = len(IMAGE_PLACEHOLDER)
         VIDEO_PLACEHOLDER_LEN = len(VIDEO_PLACEHOLDER)
 
+        def _find_token(prompt_token_ids, token_id, start):
+            try:
+                return prompt_token_ids.index(token_id, start)
+            except ValueError:
+                return len(prompt_token_ids)
+
         # Initialize tracking variables for text parsing
         st, image_idx, video_idx = 0, 0, 0  # Start position, image counter, video counter
-        while st < len(text):
+        text_len = len(text)
+        while st < text_len:
             # Find next image or video placeholder in text
-            image_pos = text.find(IMAGE_PLACEHOLDER, st)
-            image_pos = len(text) if image_pos == -1 else image_pos  # Set to end if not found
-            video_pos = text.find(VIDEO_PLACEHOLDER, st)
-            video_pos = len(text) if video_pos == -1 else video_pos  # Set to end if not found
+            if isinstance(text, list) and isinstance(text[0], int):
+                image_pos = _find_token(text, self.image_token_id, st)
+                video_pos = _find_token(text, self.video_token_id, st)
+            else:
+                image_pos = text.find(IMAGE_PLACEHOLDER, st)
+                image_pos = text_len if image_pos == -1 else image_pos
+
+                video_pos = text.find(VIDEO_PLACEHOLDER, st)
+                video_pos = text_len if video_pos == -1 else video_pos
             ed = min(image_pos, video_pos)  # End position is first placeholder found
 
             self._add_text(text[st:ed], outputs)
