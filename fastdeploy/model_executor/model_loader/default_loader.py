@@ -85,6 +85,16 @@ class DefaultModelLoader(BaseModelLoader):
         with context:
             model_cls = ModelRegistry.get_class(architectures)
             model = model_cls(fd_config)
+            if fd_config.cache_config.cpu_offload_gb:
+                from fastdeploy.model_executor.offload_utils import (
+                    apply_cpu_offload_to_model,
+                )
+
+                apply_cpu_offload_to_model(
+                    model,
+                    fd_config.cache_config.cpu_offload_gb,
+                    show_progress=True,
+                )
 
         model.eval()
 

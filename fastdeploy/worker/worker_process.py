@@ -660,6 +660,12 @@ def parse_args():
         default=0.9,
         help="gpu memory utilization",
     )
+    parser.add_argument(
+        "--cpu-offload-gb",
+        type=float,
+        default=0,
+        help="CPU offload budget (GiB) for model weights per GPU.",
+    )
     parser.add_argument("--engine_pid", type=int, default=None, help="Process ID of engine")
     parser.add_argument("--do_profile", action="store_true", help="do profile or not")
     parser.add_argument("--pad_token_id", type=int, default=-1, help="pad token id")

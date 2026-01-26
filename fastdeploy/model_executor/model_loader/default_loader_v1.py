@@ -89,6 +89,16 @@ class DefaultModelLoaderV1(BaseModelLoader):
                     assert_never(convert_type)
 
                 model = model_cls(fd_config)
+                if fd_config.cache_config.cpu_offload_gb:
+                    from fastdeploy.model_executor.offload_utils import (
+                        apply_cpu_offload_to_model,
+                    )
+
+                    apply_cpu_offload_to_model(
+                        model,
+                        fd_config.cache_config.cpu_offload_gb,
+                        show_progress=True,
+                    )
                 if fd_config.load_config.dynamic_load_weight or fd_config.model_config.enable_cache:
                     process_final_after_loading(model, fd_config)
 

@@ -548,6 +548,7 @@ class LLMEngine:
             f" --max_num_batched_tokens {self.cfg.scheduler_config.max_num_batched_tokens}"
             f" --splitwise_role {self.cfg.scheduler_config.splitwise_role}"
             f" --kv_cache_ratio {self.cfg.cache_config.kv_cache_ratio}"
+            f" --cpu-offload-gb {self.cfg.cache_config.cpu_offload_gb}"
             f" --expert_parallel_size {self.cfg.parallel_config.expert_parallel_size}"
             f" --chunked_moe_size {self.cfg.parallel_config.chunked_moe_size}"
             f" --data_parallel_size {self.cfg.parallel_config.data_parallel_size}"

@@ -1289,6 +1289,7 @@ class CacheConfig:
         prealloc_dec_block_slot_num_threshold (int): Number of token slot threadshold to allocate next blocks for decoding.
         enable_prefix_caching (bool): Flag to enable prefix caching.
         enable_output_caching (bool): Flag to enable kv cache output tokens, only works in V1 scheduler.
+        cpu_offload_gb (float): CPU offload budget for model weights (GiB) per GPU.
     """
 
     def __init__(self, args):
@@ -1307,6 +1308,7 @@ class CacheConfig:
             enable_prefix_caching (bool): Enable prefix caching.
             max_encoder_cache(int): Maximum number of tokens in the encoder cache.
             max_processor_cache(int): Maximum number of bytes in the processor cache.
+            cpu_offload_gb (float): CPU offload budget for model weights (GiB) per GPU.
         """
         self.block_size = 64
         self.gpu_memory_utilization = 0.9
@@ -1330,6 +1332,7 @@ class CacheConfig:
         self.cache_queue_port = None
         self.local_cache_queue_port = None
         self.swap_space = None
+        self.cpu_offload_gb = 0
         self.max_encoder_cache = None
         self.max_processor_cache = None
         self.enable_output_caching = False
@@ -1396,6 +1399,8 @@ class CacheConfig:
             raise ValueError("GPU memory utilization must be less than 1.0. Got " f"{self.gpu_memory_utilization}.")
         if self.kv_cache_ratio > 1.0:
             raise ValueError("KV cache ratio must be less than 1.0. Got " f"{self.kv_cache_ratio}.")
+        if self.cpu_offload_gb < 0:
+            raise ValueError("cpu_offload_gb must be >= 0. Got " f"{self.cpu_offload_gb}.")
 
     def postprocess(self, num_total_tokens, number_of_tasks):
         """

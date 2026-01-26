@@ -164,6 +164,7 @@ class GpuWorker(WorkerBase):
                 f"\nDevice free memory: {after_run_meminfo.free / Gb}",
                 f"\nPaddle reserved memory: {paddle_reserved_mem_after_run / Gb}",
                 f"\nPaddle allocated memory: {paddle_allocated_mem_after_run / Gb}",
+                f"\nBaseline free memory: {before_run_meminfo.free / Gb}",
                 f"\nAvailable KV Cache meomory: {available_kv_cache_memory / Gb}",
                 f"Profile time: {end_time - start_time}",
             )

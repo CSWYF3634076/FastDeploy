@@ -1505,6 +1505,18 @@ class GPUModelRunner(ModelRunnerBase):
             from fastdeploy.rl.dynamic_weight_manager import DynamicWeightManager
 
             self.dynamic_weight_manager = DynamicWeightManager(self.fd_config, self.model)
+        elif self.cache_config.cpu_offload_gb and not getattr(self.model, "_fd_cpu_offload_enabled", False):
+            from fastdeploy.model_executor.offload_utils import (
+                apply_cpu_offload_to_model,
+            )
+
+            apply_cpu_offload_to_model(
+                self.model,
+                self.cache_config.cpu_offload_gb,
+                device=self.device,
+                device_id=self.device_id,
+                show_progress=True,
+            )
 
         # 2. Load lora model
 
