@@ -90,7 +90,14 @@ def _offload_layer_params_to_pinned(layer: nn.Layer) -> None:
             shape = getattr(param, "shape", None)
             if shape is None or any(dim is None or dim < 0 for dim in shape):
                 continue
-            cpu_data = paddle.zeros(shape, dtype=param.dtype, device=pinned_place)
+            cpu_data = paddle.zeros(shape, dtype=param.dtype, device=pinned_place, pin_memory=True)
+            logger.warning(
+                "CPU offload init param: shape=%s dtype=%s param_place=%s cpu_place=%s",
+                shape,
+                param.dtype,
+                param.place,
+                cpu_data.place,
+            )
             param._fd_cpu_data = cpu_data
             cpu_tensor = cpu_data.value().get_tensor()
             param_tensor = param.value().get_tensor()
@@ -110,6 +117,8 @@ def _offload_layer_params_to_pinned(layer: nn.Layer) -> None:
         if gpu_data is not None:
             gpu_data.value().get_tensor()._clear()
             param._fd_gpu_data = None
+
+    logger.warning("offload_layer_params_to_pinned %s", layer)
 
 
 def _load_layer_params_to_device(layer: nn.Layer, device_place: paddle.Place) -> None:
