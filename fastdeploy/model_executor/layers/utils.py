@@ -15,6 +15,7 @@
 """
 
 import functools
+import logging
 from typing import Tuple, Union
 
 import numpy as np
@@ -24,6 +25,8 @@ from paddle.framework import in_dynamic_mode
 from scipy.linalg import block_diag
 
 from fastdeploy.platforms import current_platform
+
+logger = logging.getLogger(__name__)
 
 if current_platform.is_cuda() and current_platform.available():
     try:
@@ -40,6 +43,29 @@ from fastdeploy import envs
 cache_params = envs.FD_CACHE_PARAMS
 if cache_params != "none":
     c8_state_dict = paddle.load(cache_params, return_numpy=True)
+
+
+def _log_cuda_memory(prefix: str) -> None:
+    if not current_platform.is_cuda():
+        return
+    device_id_str = paddle.device.get_device().split(":")[-1]
+    try:
+        device_id = int(device_id_str)
+    except Exception:
+        device_id = 0
+    max_alloc_gb = paddle.device.cuda.max_memory_allocated(device_id) / 1024**3
+    max_reserved_gb = paddle.device.cuda.max_memory_reserved(device_id) / 1024**3
+    allocated_gb = paddle.device.cuda.memory_allocated(device_id) / 1024**3
+    reserved_gb = paddle.device.cuda.memory_reserved(device_id) / 1024**3
+    logger.warning(
+        f"{prefix} GPU{device_id} mem GiB -> "
+        f"max_allocated: {max_alloc_gb:.3f}, max_reserved: {max_reserved_gb:.3f}, "
+        f"allocated: {allocated_gb:.3f}, reserved: {reserved_gb:.3f}"
+    )
+
+
+def log_cuda_memory(prefix: str) -> None:
+    _log_cuda_memory(prefix)
 
 
 DEFAULT_VOCAB_PADDING_SIZE = 64

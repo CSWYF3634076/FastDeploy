@@ -202,7 +202,7 @@ class Qwen3VLForConditionalGeneration(ModelForCasualLM):
         # params_name model.embed_tokens.embeddings.weight
         # weight_name model.language_model.embed_tokens.weight
         process_weights_after_loading_fn = process_weights_after_loading(dict(self.named_sublayers()), self.fd_config)
-        logger.info(f"[Qwen3-VL] params_dict names: {list(params_dict.keys())} ")
+        # logger.info(f"[Qwen3-VL] params_dict names: {list(params_dict.keys())} ")
         for loaded_weight_name, loaded_weight in weights_iterator:
             loaded_weight_name = loaded_weight_name.replace(".language_model", "")
             for param_name, weight_name, shard_id in stacked_params_mapping:

@@ -14,6 +14,8 @@
 # limitations under the License.
 """
 
+import logging
+
 import paddle
 from paddle import nn
 from typing_extensions import assert_never
@@ -32,6 +34,8 @@ from fastdeploy.model_executor.models.model_base import ModelRegistry
 from fastdeploy.model_executor.utils import process_final_after_loading
 from fastdeploy.platforms import current_platform
 
+logger = logging.getLogger(__name__)
+
 
 class DefaultModelLoaderV1(BaseModelLoader):
     """ModelLoader that can load registered models"""
@@ -48,16 +52,50 @@ class DefaultModelLoaderV1(BaseModelLoader):
             paddle.device.empty_cache()
             paddle.device.synchronize()
 
+    def _log_cuda_memory(self, prefix: str) -> None:
+        """Log current and peak CUDA memory stats."""
+        if not current_platform.is_cuda():
+            return
+
+        device_id = paddle.device.get_device().split(":")[-1]
+        try:
+            device_id_int = int(device_id)
+        except ValueError:
+            device_id_int = 0
+
+        max_alloc_gb = paddle.device.cuda.max_memory_allocated(device_id_int) / 1024**3
+        max_reserved_gb = paddle.device.cuda.max_memory_reserved(device_id_int) / 1024**3
+        allocated_gb = paddle.device.cuda.memory_allocated(device_id_int) / 1024**3
+        reserved_gb = paddle.device.cuda.memory_reserved(device_id_int) / 1024**3
+        logger.warning(
+            "%s GPU%d mem GiB -> max_allocated: %.3f, max_reserved: %.3f, allocated: %.3f, reserved: %.3f",
+            prefix,
+            device_id_int,
+            max_alloc_gb,
+            max_reserved_gb,
+            allocated_gb,
+            reserved_gb,
+        )
+
     @save_model()
     @measure_time()
     def load_weights(self, model, fd_config: FDConfig, enable_cache: bool = False) -> None:
         weights_iterator = get_weight_iterator(fd_config.model_config.model)
+        # reset max stats before load to report pure load cost
+        if current_platform.is_cuda():
+            paddle.device.cuda.reset_max_memory_allocated()
+            paddle.device.cuda.reset_max_memory_reserved()
+
+        self._log_cuda_memory("[load_weights] before")
+
         if enable_cache:
             load_weights_from_cache(model, weights_iterator)
         else:
             model.load_weights(weights_iterator)
 
+        self._log_cuda_memory("[process_final_after_loading] before")
         process_final_after_loading(model, fd_config)
+        self._log_cuda_memory("[process_final_after_loading] after")
 
         self.clean_memory_fragments()
 

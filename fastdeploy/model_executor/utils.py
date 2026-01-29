@@ -26,7 +26,7 @@ from paddleformers.utils.log import logger
 
 from fastdeploy import envs
 from fastdeploy.config import FDConfig
-from fastdeploy.model_executor.layers.utils import get_tensor
+from fastdeploy.model_executor.layers.utils import get_tensor, log_cuda_memory
 from fastdeploy.platforms import current_platform
 
 
@@ -115,16 +115,60 @@ def set_weight_attrs(param, param_attr_map: Optional[dict[str, Any]]):
 
 
 def slice_fn(weight_or_paramter, output_dim, start, end, step=1):
+    def _is_pinned_place(x) -> bool:
+        try:
+            place = x.place
+            # if isinstance(place, paddle.CPUPlace):
+            if isinstance(place, paddle.CUDAPinnedPlace):
+                return True
+            # Fallback: some Paddle versions expose place as a core.Place with string repr
+            return "gpu_pinned" in str(place)
+            # return "cpu" in str(place)
+        except Exception:
+            return False
+
+    def _slice_impl(tensor):
+        if hasattr(tensor, "get_shape"):
+            shape = tensor.get_shape()
+        else:
+            shape = tensor.shape
+        if len(shape) == 1:
+            return tensor[start:end]
+        elif output_dim:
+            return tensor[..., start:end]
+        else:
+            return tensor[start:end, ...]
+
+    # Avoid implicit H2D: if input is pinned CPU, slice on CPU and keep pinned output
+    if _is_pinned_place(weight_or_paramter):
+        # old = paddle.device.get_device()
+        # paddle.device.set_device("cpu")
+        # cpu_tensor = weight_or_paramter.cpu().clone() if hasattr(weight_or_paramter, "cpu") else weight_or_paramter
+        log_cuda_memory(f"[slice_fn] before param _slice_impl weight_or_paramter.place={weight_or_paramter.place}")
+        weight_or_paramter = _slice_impl(weight_or_paramter).contiguous()
+        # sliced_gpu = sliced_gpu.clone()
+        # arr = sliced_gpu.numpy()
+        weight_or_paramter = paddle.to_tensor(weight_or_paramter, place=paddle.CUDAPinnedPlace())
+        # weight_or_paramter = paddle.to_tensor(arr, place=paddle.CPUPlace())
+        # weight_or_paramter = sliced_gpu._copy_to(paddle.CUDAPinnedPlace(), True)
+        # del sliced_gpu
+        log_cuda_memory(f"[slice_fn] after param _slice_impl weight_or_paramter.place={weight_or_paramter.place}")
+        # paddle.device.set_device(old)
+        # return sliced
+        return weight_or_paramter
+
     if hasattr(weight_or_paramter, "get_shape"):
         shape = weight_or_paramter.get_shape()
     else:
         shape = weight_or_paramter.shape
+    log_cuda_memory(f"[slice_fn] before param slice shape={shape} weight_or_paramter.place={weight_or_paramter.place}")
     if len(shape) == 1:
         weight_or_paramter = weight_or_paramter[start:end]
     elif output_dim:
         weight_or_paramter = weight_or_paramter[..., start:end]
     else:
         weight_or_paramter = weight_or_paramter[start:end, ...]
+    log_cuda_memory(f"[slice_fn] after param slice shape={shape} weight_or_paramter.place={weight_or_paramter.place}")
     return weight_or_paramter
 
 
