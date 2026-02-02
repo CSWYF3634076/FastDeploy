@@ -16,6 +16,7 @@
 
 import os
 import re
+import time
 from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -143,12 +144,12 @@ def slice_fn(weight_or_paramter, output_dim, start, end, step=1):
     if _is_pinned_place(weight_or_paramter):
         # old = paddle.device.get_device()
         # paddle.device.set_device("cpu")
-        # cpu_tensor = weight_or_paramter.cpu().clone() if hasattr(weight_or_paramter, "cpu") else weight_or_paramter
+        # cpu_tensor = weight_or_paramter if hasattr(weight_or_paramter, "cpu") else weight_or_paramter
         log_cuda_memory(f"[slice_fn] before param _slice_impl weight_or_paramter.place={weight_or_paramter.place}")
-        weight_or_paramter = _slice_impl(weight_or_paramter).contiguous()
+        weight_or_paramter = _slice_impl(weight_or_paramter)
         # sliced_gpu = sliced_gpu.clone()
         # arr = sliced_gpu.numpy()
-        weight_or_paramter = paddle.to_tensor(weight_or_paramter, place=paddle.CUDAPinnedPlace())
+        # weight_or_paramter = paddle.to_tensor(weight_or_paramter, place=paddle.CUDAPinnedPlace())
         # weight_or_paramter = paddle.to_tensor(arr, place=paddle.CPUPlace())
         # weight_or_paramter = sliced_gpu._copy_to(paddle.CUDAPinnedPlace(), True)
         # del sliced_gpu
@@ -173,7 +174,19 @@ def slice_fn(weight_or_paramter, output_dim, start, end, step=1):
 
 
 def process_weight_transpose(layer, weight_name):
+    t0 = time.perf_counter()  # entry
     weight = getattr(layer, weight_name)
+    t1 = time.perf_counter()  # get weight
+    # if getattr(weight, "_fd_transposed_on_load", False):
+    #     weight._fd_transposed_on_load = False
+    #     return
+    # try:
+    #     weight_place = weight.place
+    # except Exception:
+    #     weight_place = None
+    # if weight_place is not None:
+    in_cpu_place = weight.place in (paddle.CPUPlace(), paddle.CUDAPinnedPlace())
+
     if len(weight.shape) == 2:
         weight_shape = weight.shape[::-1]
     elif len(weight.shape) == 3:
@@ -181,21 +194,37 @@ def process_weight_transpose(layer, weight_name):
     weight_tmp = layer.create_parameter(
         shape=weight_shape,
         dtype=weight.dtype,
+        device=weight.place,
         default_initializer=paddle.nn.initializer.Constant(0),
         is_bias=False,
     )
-    if layer.fd_config.load_config.dynamic_load_weight or getattr(layer.fd_config.model_config, "enable_cache", False):
-        free_tensor(weight)
-        setattr(layer, weight_name, weight_tmp)
-        return
+    t2 = time.perf_counter()  # alloc
 
     if len(weight.shape) == 2:
         weight_transpose = weight.transpose([1, 0])
     elif len(weight.shape) == 3:
         weight_transpose = weight.transpose([0, 2, 1])
-    weight_tmp.copy_(weight_transpose, False)
+    t3 = time.perf_counter()  # transpose launch
+    # weight_tmp.copy_(weight_transpose, False)
+    if in_cpu_place:
+        param_tensor = weight_tmp.value().get_tensor()
+        weight_transpose_tensor = weight_transpose.value().get_tensor()
+        param_tensor._share_data_with(weight_transpose_tensor)
+    else:
+        weight_tmp.copy_(weight_transpose, False)
+    t4 = time.perf_counter()  # copy launch
     free_tensor(weight)
     setattr(layer, weight_name, weight_tmp)
+
+    t5 = time.perf_counter()  # done
+    print(
+        f"[process_weight_transpose] {weight_name} | "
+        f"get={((t1-t0)*1000):.2f}ms | "
+        f"alloc={((t2-t1)*1000):.2f}ms | "
+        f"transpose={((t3-t2)*1000):.2f}ms | "
+        f"copy={((t4-t3)*1000):.2f}ms | "
+        f"total={((t5-t0)*1000):.2f}ms"
+    )
 
 
 def process_weights_after_loading(sublayers_dict: dict, fd_config: FDConfig):
@@ -311,6 +340,7 @@ def process_final_after_loading(model, fd_config: FDConfig):
                 continue
         if not hasattr(sublayer, "process_weights_after_loading"):
             continue
+        log_cuda_memory(f"[sublayer.process_weights_after_loading] before {name}")
         sublayer.process_weights_after_loading()
 
 
@@ -358,8 +388,31 @@ def default_weight_loader(fd_config: FDConfig = None) -> None:
         """fn"""
         output_dim = getattr(param, "output_dim", None)
         weight_need_transpose = getattr(param, "weight_need_transpose", False)
-        if weight_need_transpose:
-            loaded_weight = loaded_weight.transpose([1, 0])
+        try:
+            param_place = param.place
+        except Exception:
+            param_place = None
+        if param_place is None:
+            is_cpu_load = False
+        else:
+            place_str = str(param_place).lower()
+            is_cpu_load = ("cpu" in place_str) or ("pinned" in place_str)
+        if not is_cpu_load:
+            if hasattr(loaded_weight, "get_shape"):
+                loaded_shape = loaded_weight.get_shape()
+            else:
+                loaded_shape = loaded_weight.shape
+            if weight_need_transpose:
+                loaded_weight = loaded_weight.transpose([1, 0])
+                param._fd_transposed_on_load = True
+                param.weight_need_transpose = False
+            elif len(loaded_shape) == 2 and param.shape == loaded_shape[::-1]:
+                loaded_weight = loaded_weight.transpose([1, 0])
+                param._fd_transposed_on_load = True
+            elif len(loaded_shape) == 3 and param.shape[0] == loaded_shape[0]:
+                if param.shape[1] == loaded_shape[2] and param.shape[2] == loaded_shape[1]:
+                    loaded_weight = loaded_weight.transpose([0, 2, 1])
+                    param._fd_transposed_on_load = True
         # Tensor parallelism splits the weight along the output_dim
         if output_dim is not None and fd_config is not None and fd_config.parallel_config.tensor_parallel_size > 1:
             dim = -1 if output_dim else 0

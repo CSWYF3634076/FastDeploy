@@ -84,15 +84,15 @@ def _offload_layer_params_to_pinned(layer: nn.Layer) -> None:
     if not paddle.is_compiled_with_cuda():
         layer.to(paddle.CPUPlace())
         return
-    pinned_place = paddle.CUDAPinnedPlace()
-    # pinned_place = paddle.CPUPlace()
+    # pinned_place = paddle.CUDAPinnedPlace()
+    pinned_place = paddle.CPUPlace()
     for param in layer.parameters():
         if hasattr(param, "_is_initialized") and not param._is_initialized():
             shape = getattr(param, "shape", None)
             if shape is None or any(dim is None or dim < 0 for dim in shape):
                 continue
-            cpu_data = paddle.zeros(shape, dtype=param.dtype, device=pinned_place, pin_memory=True)
-            # cpu_data = paddle.zeros(shape, dtype=param.dtype, device=pinned_place)
+            # cpu_data = paddle.zeros(shape, dtype=param.dtype, device=pinned_place, pin_memory=True)
+            cpu_data = paddle.zeros(shape, dtype=param.dtype, device=pinned_place)
             logger.warning(
                 "CPU offload init param: shape=%s dtype=%s param_place=%s cpu_place=%s",
                 shape,
