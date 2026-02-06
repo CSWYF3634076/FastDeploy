@@ -184,6 +184,9 @@ class ExpertService:
         """
 
         if hasattr(self, "cache_manager_processes"):
+            cache_manager = getattr(self.engine.resource_manager, "cache_manager", None)
+            if cache_manager is not None and hasattr(cache_manager, "stop_background_threads"):
+                cache_manager.stop_background_threads()
             self.engine.resource_manager.cache_manager.shm_cache_task_flag_broadcast.clear()
             for p in self.cache_manager_processes:
                 self.llm_logger.info(f"Killing cache manager process {p.pid}")

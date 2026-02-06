@@ -122,6 +122,10 @@ class PrefixCacheManager:
         self.gpu_free_task_future = None
         self.cache_status_lock = Lock()
 
+        # Background thread stop event
+        self._recv_data_transfer_result_stop_event = threading.Event()
+        self._recv_data_transfer_result_thread = None
+
         logger.info(
             f"num_gpu_blocks_server_owned {self.num_gpu_blocks} num_cpu_blocks "
             + f"{self.num_cpu_blocks}, bytes_per_layer_per_block {self.cache_config.bytes_per_layer_per_block}"
@@ -335,7 +339,10 @@ class PrefixCacheManager:
         # Start additional threads
         if cache_config.kvcache_storage_backend or self.num_cpu_blocks > 0:
             logger.info("Enable hierarchical cache.")
-            threading.Thread(target=self.recv_data_transfer_result, daemon=True).start()
+            self._recv_data_transfer_result_thread = threading.Thread(
+                target=self.recv_data_transfer_result, daemon=True
+            )
+            self._recv_data_transfer_result_thread.start()
         if cache_config.enable_prefix_caching:
             threading.Thread(target=self.clear_prefix_cache, daemon=True).start()
 
@@ -1955,7 +1962,7 @@ class PrefixCacheManager:
         """
         recv data transfer result
         """
-        while True:
+        while not self._recv_data_transfer_result_stop_event.is_set():
 
             try:
                 data = self.cache_task_queue.get_transfer_done_signal()
@@ -2004,8 +2011,19 @@ class PrefixCacheManager:
                         + f"task_cpu_block_id {task_cpu_block_id} event_type {event_type} done"
                     )
             except Exception as e:
+                if self._recv_data_transfer_result_stop_event.is_set():
+                    logger.warning(f"recv_data_transfer_result: exit receive thread on shutdown, error: {e}")
+                    break
                 logger.warning(f"recv_data_transfer_result: error: {e}, {str(traceback.format_exc())}")
                 raise e
+
+    def stop_background_threads(self):
+        """
+        Stop background threads gracefully.
+        """
+        self._recv_data_transfer_result_stop_event.set()
+        if self._recv_data_transfer_result_thread is not None and self._recv_data_transfer_result_thread.is_alive():
+            self._recv_data_transfer_result_thread.join(timeout=2)
 
     def reset(self):
         """

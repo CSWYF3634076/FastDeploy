@@ -1717,15 +1717,22 @@ class EngineService:
             # Clean up cache manager processes
             if hasattr(self, "cache_manager_processes"):
                 self.llm_logger.info("Cleaning up cache manager processes...")
+                cache_manager = getattr(self.resource_manager, "cache_manager", None)
+                if cache_manager is not None and hasattr(cache_manager, "stop_background_threads"):
+                    cache_manager.stop_background_threads()
                 self.resource_manager.cache_manager.shm_cache_task_flag_broadcast.clear()
                 self.resource_manager.cache_manager.cache_ready_signal.clear()
                 for p in self.cache_manager_processes:
                     self.llm_logger.info(f"Killing cache manager process {p.pid}")
+                    console_logger.info(f"Killing cache manager process {p.pid}")
                     try:
                         pgid = os.getpgid(p.pid)
                         os.killpg(pgid, signal.SIGTERM)
                     except Exception as e:
                         self.llm_logger.error(
+                            f"Error killing cache manager process {p.pid}: {e}, {str(traceback.format_exc())}"
+                        )
+                        console_logger.error(
                             f"Error killing cache manager process {p.pid}: {e}, {str(traceback.format_exc())}"
                         )
 

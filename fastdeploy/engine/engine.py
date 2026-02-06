@@ -409,12 +409,17 @@ class LLMEngine:
         llm_logger.info("Engine shut down, exiting sub services...")
 
         if hasattr(self, "cache_manager_processes"):
+            console_logger.info("Cleaning up cache manager processes...")
+            cache_manager = getattr(self.engine.resource_manager, "cache_manager", None)
+            if cache_manager is not None and hasattr(cache_manager, "stop_background_threads"):
+                cache_manager.stop_background_threads()
             if hasattr(self.engine.resource_manager.cache_manager, "shm_cache_task_flag_broadcast"):
                 self.engine.resource_manager.cache_manager.shm_cache_task_flag_broadcast.clear()
             if hasattr(self.engine.resource_manager.cache_manager, "cache_ready_signal"):
                 self.engine.resource_manager.cache_manager.cache_ready_signal.clear()
             for p in self.cache_manager_processes:
                 llm_logger.info(f"Killing cache manager process {p.pid}")
+                console_logger.info(f"Killing cache manager process {p.pid}")
                 try:
                     pgid = os.getpgid(p.pid)
                     os.killpg(pgid, signal.SIGTERM)
@@ -428,7 +433,7 @@ class LLMEngine:
         if hasattr(self, "get_profile_block_num_signal"):
             self.get_profile_block_num_signal.clear()
 
-        if hasattr(self, "worker_proc") and self.worker_proc is not None:
+        if hasattr(self, "worker_proc") and self.worker_proc is not None and self.worker_proc.poll() is None:
             try:
                 pgid = os.getpgid(self.worker_proc.pid)
                 os.killpg(pgid, signal.SIGTERM)
