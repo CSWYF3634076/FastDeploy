@@ -566,7 +566,6 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                 shard_offset = self.local_rank * block_size
                 shard_size = (self.local_rank + 1) * block_size
                 loaded_weight = slice_fn(loaded_weight, output_dim, start=shard_offset, end=shard_size)
-            # if not param._is_initialized() and getattr(param, "_fd_cpu_data", None) is None:
             if not param._is_initialized():
                 param.initialize()
             param_shard_size = output_size // 2
@@ -720,7 +719,7 @@ class QKVParallelLinear(ColumnParallelLinear):
                 shard_size = block_size
                 loaded_weight = slice_fn(loaded_weight, output_dim, start=shard_offset, end=shard_offset + shard_size)
 
-            if not param._is_initialized() and getattr(param, "_fd_cpu_data", None) is None:
+            if not param._is_initialized():
                 param.initialize()
 
             if loaded_shard_id == "q":
