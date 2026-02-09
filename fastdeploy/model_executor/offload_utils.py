@@ -66,6 +66,12 @@ def _layer_nbytes(params: Iterable[paddle.Tensor]) -> int:
     return sum(_param_nbytes(p) for p in params)
 
 
+def _exclude_offload_layerlist(name: str) -> bool:
+    # Keep vision tower layers on GPU to avoid multimodal image understanding regressions.
+    name_l = name.lower()
+    return any(key in name_l for key in ("vision", "visual", "resampler", "projector"))
+
+
 def _offload_layer_to_cpu(layer: nn.Layer) -> None:
     if getattr(layer, "_fd_cpu_offloaded", False):
         return
@@ -84,16 +90,27 @@ def _offload_layer_params_to_pinned(layer: nn.Layer) -> None:
     if not paddle.is_compiled_with_cuda():
         layer.to(paddle.CPUPlace())
         return
-    # pinned_place = paddle.CUDAPinnedPlace()
-    pinned_place = paddle.CPUPlace()
+    try:
+        pinned_place = paddle.CUDAPinnedPlace()
+    except Exception:
+        logger.warning("CUDAPinnedPlace is unavailable, fallback to CPUPlace for offload buffers.")
+        pinned_place = paddle.CPUPlace()
     for param in layer.parameters():
         if hasattr(param, "_is_initialized") and not param._is_initialized():
             shape = getattr(param, "shape", None)
             if shape is None or any(dim is None or dim < 0 for dim in shape):
                 continue
-            # cpu_data = paddle.zeros(shape, dtype=param.dtype, device=pinned_place, pin_memory=True)
-            cpu_data = paddle.zeros(shape, dtype=param.dtype, device=pinned_place)
-            logger.warning(
+            try:
+                cpu_data = paddle.zeros(shape, dtype=param.dtype, device=pinned_place, pin_memory=True)
+            except Exception:
+                # Some Paddle builds do not support direct pinned allocation in zeros().
+                cpu_data = paddle.zeros(shape, dtype=param.dtype, device=paddle.CPUPlace())
+                if not isinstance(pinned_place, paddle.CPUPlace):
+                    try:
+                        cpu_data = cpu_data._copy_to(pinned_place, True)
+                    except Exception:
+                        pass
+            logger.debug(
                 "CPU offload init param: shape=%s dtype=%s param_place=%s cpu_place=%s",
                 shape,
                 param.dtype,
@@ -254,7 +271,11 @@ def _apply_offload_to_layerlists(
     wrap_forward: bool,
     show_progress: bool,
 ) -> int:
-    layer_lists = [sublayer for _, sublayer in model.named_sublayers() if isinstance(sublayer, nn.LayerList)]
+    layer_lists = [
+        sublayer
+        for name, sublayer in model.named_sublayers()
+        if isinstance(sublayer, nn.LayerList) and not _exclude_offload_layerlist(name)
+    ]
     total_layers = sum(len(layer_list) for layer_list in layer_lists)
     if total_layers == 0:
         return 0

@@ -526,9 +526,6 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         )
 
     def weight_loader(self, param, loaded_weight, loaded_shard_id: Optional[str] = None):
-        from fastdeploy.model_executor.layers.utils import log_cuda_memory
-
-        log_cuda_memory(f"[MergedColumnParallelLinear] entry shard={loaded_shard_id}")
         # for xpu and other backend
         weight_need_transpose = getattr(param, "weight_need_transpose", False)
         output_dim = getattr(param, "output_dim", None)
@@ -560,7 +557,6 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                 loaded_weight = loaded_weight.transpose([1, 0])
             # Tensor parallelism splits the weight along the output_dim
             if self.tp_size > 1 and output_dim is not None:
-                log_cuda_memory(f"[MergedColumnParallelLinear] before tp-slice shard={loaded_shard_id}")
                 dim = -1 if output_dim else 0
                 if isinstance(loaded_weight, (np.ndarray, paddle.Tensor)):
                     size = loaded_weight.shape[dim]
@@ -570,11 +566,9 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                 shard_offset = self.local_rank * block_size
                 shard_size = (self.local_rank + 1) * block_size
                 loaded_weight = slice_fn(loaded_weight, output_dim, start=shard_offset, end=shard_size)
-                log_cuda_memory(f"[MergedColumnParallelLinear] after tp-slice shard={loaded_shard_id}")
+            # if not param._is_initialized() and getattr(param, "_fd_cpu_data", None) is None:
             if not param._is_initialized():
-                log_cuda_memory(f"[MergedColumnParallelLinear] before init shard={loaded_shard_id}")
                 param.initialize()
-                log_cuda_memory(f"[MergedColumnParallelLinear] after init shard={loaded_shard_id}")
             param_shard_size = output_size // 2
             if loaded_shard_id == "gate":
                 param_shard_offset = 0
@@ -583,9 +577,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                 param_shard_offset = param_shard_size
             if hasattr(param, "tensor_track"):
                 param.tensor_track.mark(start=param_shard_offset, end=param_shard_offset + param_shard_size)
-            log_cuda_memory(f"[MergedColumnParallelLinear] before param slice shard={loaded_shard_id}")
             param = slice_fn(param, output_dim, start=param_shard_offset, end=param_shard_offset + param_shard_size)
-            log_cuda_memory(f"[MergedColumnParallelLinear] after param slice shard={loaded_shard_id}")
             assert param.shape == loaded_weight.shape, (
                 f" Attempted to load weight ({loaded_weight.shape}) " f"into parameter ({param.shape})"
             )
@@ -594,14 +586,8 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                 if loaded_weight.dtype == paddle.int8 and param.dtype == paddle.float8_e4m3fn:
                     loaded_weight = loaded_weight.view(param.dtype)
                 else:
-                    log_cuda_memory(f"[MergedColumnParallelLinear] before cast shard={loaded_shard_id}")
                     loaded_weight = loaded_weight.cast(param.dtype)
-                    log_cuda_memory(f"[MergedColumnParallelLinear] after cast shard={loaded_shard_id}")
-
-            log_cuda_memory(f"[MergedColumnParallelLinear] before h2d_copy shard={loaded_shard_id}")
             h2d_copy(param, loaded_weight)
-            log_cuda_memory(f"[MergedColumnParallelLinear] after h2d_copy shard={loaded_shard_id}")
-        log_cuda_memory(f"[MergedColumnParallelLinear] exit shard={loaded_shard_id}")
 
     def load_state_dict(self, state_dict: dict):
         """
@@ -734,7 +720,7 @@ class QKVParallelLinear(ColumnParallelLinear):
                 shard_size = block_size
                 loaded_weight = slice_fn(loaded_weight, output_dim, start=shard_offset, end=shard_offset + shard_size)
 
-            if not param._is_initialized():
+            if not param._is_initialized() and getattr(param, "_fd_cpu_data", None) is None:
                 param.initialize()
 
             if loaded_shard_id == "q":

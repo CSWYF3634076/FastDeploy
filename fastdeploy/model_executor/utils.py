@@ -30,6 +30,126 @@ from fastdeploy.config import FDConfig
 from fastdeploy.model_executor.layers.utils import get_tensor, log_cuda_memory
 from fastdeploy.platforms import current_platform
 
+_PINNED_SLICE_PARENTS = {}
+_TRANSPOSE_FAST_MAX_PEAK_GB = 1.5
+_TRANSPOSE_FAST_MAX_PEAK_RATIO = 0.08
+_TRANSPOSE_FAST_SAFETY_MARGIN_MB = 256
+
+_DTYPE_NBYTES = {
+    paddle.bool: 1,
+    paddle.int8: 1,
+    paddle.uint8: 1,
+    paddle.int16: 2,
+    paddle.float16: 2,
+    paddle.bfloat16: 2,
+    paddle.int32: 4,
+    paddle.float32: 4,
+    paddle.int64: 8,
+    paddle.float64: 8,
+}
+if hasattr(paddle, "float8_e4m3fn"):
+    _DTYPE_NBYTES[paddle.float8_e4m3fn] = 1
+
+
+def _dtype_nbytes(dtype) -> int:
+    return _DTYPE_NBYTES.get(dtype, 4)
+
+
+def _tensor_nbytes(tensor) -> int:
+    shape = getattr(tensor, "shape", None)
+    if shape is None:
+        return 0
+    numel = 1
+    for dim in shape:
+        if dim is None or dim < 0:
+            return 0
+        numel *= int(dim)
+    return numel * _dtype_nbytes(tensor.dtype)
+
+
+def _current_cuda_device_id() -> int:
+    try:
+        current_device = paddle.device.get_device()
+        if current_device.startswith("gpu:"):
+            return int(current_device.split(":")[1])
+    except Exception:
+        pass
+    return 0
+
+
+def _enable_gpu_fast_transpose() -> bool:
+    value = os.getenv("FD_TRANSPOSE_GPU_FAST", "1").strip().lower()
+    return value in ("1", "true", "yes", "on")
+
+
+def _transpose_gpu_budget(weight_nbytes: int) -> dict[str, int | bool]:
+    device_id = _current_cuda_device_id()
+    max_peak_bytes = int(_TRANSPOSE_FAST_MAX_PEAK_GB * 1024**3)
+    total_memory = 0
+    reserved_memory = 0
+    try:
+        total_memory = int(paddle.device.cuda.get_device_properties(device_id).total_memory)
+        reserved_memory = int(paddle.device.cuda.memory_reserved(device_id))
+        max_peak_bytes = min(max_peak_bytes, int(total_memory * _TRANSPOSE_FAST_MAX_PEAK_RATIO))
+    except Exception:
+        pass
+
+    estimated_peak_bytes = int(weight_nbytes) * 2
+    safety_margin_bytes = int(_TRANSPOSE_FAST_SAFETY_MARGIN_MB * 1024**2)
+    available_bytes = max(0, total_memory - reserved_memory)
+    can_use_gpu_fast = total_memory > 0 and estimated_peak_bytes <= max_peak_bytes
+    can_use_gpu_fast = can_use_gpu_fast and (estimated_peak_bytes + safety_margin_bytes <= available_bytes)
+
+    return {
+        "device_id": device_id,
+        "estimated_peak_bytes": estimated_peak_bytes,
+        "max_peak_bytes": max_peak_bytes,
+        "total_memory": total_memory,
+        "reserved_memory": reserved_memory,
+        "can_use_gpu_fast": can_use_gpu_fast,
+    }
+
+
+def _transpose_meta(weight) -> tuple[list[int], list[int]]:
+    if len(weight.shape) == 2:
+        return [1, 0], weight.shape[::-1]
+    if len(weight.shape) == 3:
+        return [0, 2, 1], [weight.shape[0]] + list(weight.shape[1:][::-1])
+    raise ValueError(f"Unsupported weight rank {len(weight.shape)} in process_weight_transpose.")
+
+
+def _try_gpu_fast_host_transpose(weight, perm, debug_mem_log):
+    estimated_peak_bytes = 0
+    max_peak_bytes = 0
+    if not (_enable_gpu_fast_transpose() and _is_pinned_place(weight) and current_platform.is_cuda()):
+        return None, "gpu_fast_unavailable", estimated_peak_bytes, max_peak_bytes
+
+    budget = _transpose_gpu_budget(_tensor_nbytes(weight))
+    estimated_peak_bytes = int(budget["estimated_peak_bytes"])
+    max_peak_bytes = int(budget["max_peak_bytes"])
+    if not budget["can_use_gpu_fast"]:
+        return None, "gpu_fast_budget_blocked", estimated_peak_bytes, max_peak_bytes
+
+    src_gpu = None
+    transposed_gpu = None
+    transposed_cpu = None
+    try:
+        if debug_mem_log:
+            log_cuda_memory(f"[process_weight_transpose] gpu_fast before h2d place={weight.place}")
+        src_gpu = weight._copy_to(paddle.CUDAPlace(int(budget["device_id"])), True)
+        if debug_mem_log:
+            log_cuda_memory("[process_weight_transpose] gpu_fast after h2d")
+        transposed_gpu = src_gpu.transpose(perm)
+        if debug_mem_log:
+            log_cuda_memory("[process_weight_transpose] gpu_fast after transpose")
+        transposed_cpu = transposed_gpu._copy_to(paddle.CPUPlace(), True)
+        transposed_tensor = transposed_cpu._copy_to(weight.place, True)
+        return transposed_tensor, "gpu_fast", estimated_peak_bytes, max_peak_bytes
+    except Exception:
+        return None, "gpu_fast_error", estimated_peak_bytes, max_peak_bytes
+    finally:
+        del transposed_cpu, transposed_gpu, src_gpu
+
 
 class BitMaskTracker:
     def __init__(self, length: int):
@@ -115,18 +235,83 @@ def set_weight_attrs(param, param_attr_map: Optional[dict[str, Any]]):
         setattr(param, key, value)
 
 
-def slice_fn(weight_or_paramter, output_dim, start, end, step=1):
-    def _is_pinned_place(x) -> bool:
+def _is_pinned_place(tensor) -> bool:
+    try:
+        place = tensor.place
+        if isinstance(place, paddle.CUDAPinnedPlace):
+            return True
+        place_str = str(place).lower()
+        return "gpu_pinned" in place_str
+    except Exception:
+        return False
+
+
+def _is_gpu_place(tensor) -> bool:
+    try:
+        place = tensor.place
+        if hasattr(place, "is_gpu_place") and place.is_gpu_place():
+            return True
+        place_str = str(place).lower()
+        return "gpu" in place_str and "pinned" not in place_str
+    except Exception:
+        return False
+
+
+def _repair_pinned_parent_after_copy(dst) -> None:
+    parent = getattr(dst, "_fd_pinned_parent", None)
+    if parent is None:
+        parent = _PINNED_SLICE_PARENTS.pop(id(dst), None)
+    else:
+        _PINNED_SLICE_PARENTS.pop(id(dst), None)
+    if parent is None:
+        return
+
+    tensor_track = getattr(parent, "tensor_track", None)
+    if tensor_track is not None:
         try:
-            place = x.place
-            # if isinstance(place, paddle.CPUPlace):
-            if isinstance(place, paddle.CUDAPinnedPlace):
-                return True
-            # Fallback: some Paddle versions expose place as a core.Place with string repr
-            return "gpu_pinned" in str(place)
-            # return "cpu" in str(place)
+            if not tensor_track.is_fully_copied():
+                return
         except Exception:
-            return False
+            pass
+
+    if not _is_gpu_place(parent):
+        try:
+            setattr(dst, "_fd_pinned_parent", None)
+        except Exception:
+            pass
+        return
+
+    try:
+        pinned_place = paddle.CUDAPinnedPlace()
+    except Exception:
+        pinned_place = paddle.CPUPlace()
+
+    try:
+        pinned_parent = parent._copy_to(pinned_place, True)
+    except Exception:
+        pinned_parent = paddle.to_tensor(parent.numpy(), place=pinned_place)
+
+    try:
+        parent_tensor = parent.value().get_tensor()
+        pinned_tensor = pinned_parent.value().get_tensor()
+        parent_tensor._share_data_with(pinned_tensor)
+    except Exception:
+        parent.set_value(pinned_parent)
+
+    try:
+        dst.value().get_tensor()._clear()
+    except Exception:
+        pass
+
+    _PINNED_SLICE_PARENTS.pop(id(dst), None)
+    try:
+        setattr(dst, "_fd_pinned_parent", None)
+    except Exception:
+        pass
+
+
+def slice_fn(weight_or_paramter, output_dim, start, end, step=1):
+    debug_slice_log = os.getenv("FD_CPU_OFFLOAD_DEBUG", "0").strip().lower() in ("1", "true", "yes", "on")
 
     def _slice_impl(tensor):
         if hasattr(tensor, "get_shape"):
@@ -134,96 +319,154 @@ def slice_fn(weight_or_paramter, output_dim, start, end, step=1):
         else:
             shape = tensor.shape
         if len(shape) == 1:
-            return tensor[start:end]
+            return tensor[start:end:step]
         elif output_dim:
-            return tensor[..., start:end]
+            return tensor[..., start:end:step]
         else:
-            return tensor[start:end, ...]
+            return tensor[start:end:step, ...]
 
-    # Avoid implicit H2D: if input is pinned CPU, slice on CPU and keep pinned output
+    # Paddle can fallback pinned slice to GPU. Keep a reference to the original
+    # tensor so h2d_copy can repin after shard writes are finished.
     if _is_pinned_place(weight_or_paramter):
-        # old = paddle.device.get_device()
-        # paddle.device.set_device("cpu")
-        # cpu_tensor = weight_or_paramter if hasattr(weight_or_paramter, "cpu") else weight_or_paramter
-        log_cuda_memory(f"[slice_fn] before param _slice_impl weight_or_paramter.place={weight_or_paramter.place}")
-        weight_or_paramter = _slice_impl(weight_or_paramter)
-        # sliced_gpu = sliced_gpu.clone()
-        # arr = sliced_gpu.numpy()
-        # weight_or_paramter = paddle.to_tensor(weight_or_paramter, place=paddle.CUDAPinnedPlace())
-        # weight_or_paramter = paddle.to_tensor(arr, place=paddle.CPUPlace())
-        # weight_or_paramter = sliced_gpu._copy_to(paddle.CUDAPinnedPlace(), True)
-        # del sliced_gpu
-        log_cuda_memory(f"[slice_fn] after param _slice_impl weight_or_paramter.place={weight_or_paramter.place}")
-        # paddle.device.set_device(old)
-        # return sliced
-        return weight_or_paramter
+        if debug_slice_log:
+            log_cuda_memory(f"[slice_fn] pinned before slice place={weight_or_paramter.place}")
+        sliced = _slice_impl(weight_or_paramter)
+        if _is_gpu_place(sliced) or _is_gpu_place(weight_or_paramter):
+            try:
+                setattr(sliced, "_fd_pinned_parent", weight_or_paramter)
+            except Exception:
+                _PINNED_SLICE_PARENTS[id(sliced)] = weight_or_paramter
+        if debug_slice_log:
+            log_cuda_memory(f"[slice_fn] pinned after slice src={weight_or_paramter.place} dst={sliced.place}")
+        return sliced
 
-    if hasattr(weight_or_paramter, "get_shape"):
-        shape = weight_or_paramter.get_shape()
+    original_tensor = weight_or_paramter
+    if hasattr(original_tensor, "get_shape"):
+        shape = original_tensor.get_shape()
     else:
-        shape = weight_or_paramter.shape
-    log_cuda_memory(f"[slice_fn] before param slice shape={shape} weight_or_paramter.place={weight_or_paramter.place}")
+        shape = original_tensor.shape
+    if debug_slice_log:
+        log_cuda_memory(
+            f"[slice_fn] before param slice shape={shape} weight_or_paramter.place={original_tensor.place}"
+        )
     if len(shape) == 1:
-        weight_or_paramter = weight_or_paramter[start:end]
+        weight_or_paramter = original_tensor[start:end:step]
     elif output_dim:
-        weight_or_paramter = weight_or_paramter[..., start:end]
+        weight_or_paramter = original_tensor[..., start:end:step]
     else:
-        weight_or_paramter = weight_or_paramter[start:end, ...]
-    log_cuda_memory(f"[slice_fn] after param slice shape={shape} weight_or_paramter.place={weight_or_paramter.place}")
+        weight_or_paramter = original_tensor[start:end:step, ...]
+    if _is_gpu_place(original_tensor) and getattr(original_tensor, "_fd_cpu_data", None) is not None:
+        try:
+            setattr(weight_or_paramter, "_fd_pinned_parent", original_tensor)
+        except Exception:
+            _PINNED_SLICE_PARENTS[id(weight_or_paramter)] = original_tensor
+    if debug_slice_log:
+        log_cuda_memory(
+            f"[slice_fn] after param slice shape={shape} weight_or_paramter.place={weight_or_paramter.place}"
+        )
     return weight_or_paramter
 
 
 def process_weight_transpose(layer, weight_name):
-    t0 = time.perf_counter()  # entry
+    debug_mem_log = os.getenv("FD_CPU_OFFLOAD_DEBUG", "0").strip().lower() in ("1", "true", "yes", "on")
+    t0 = time.perf_counter()
     weight = getattr(layer, weight_name)
-    t1 = time.perf_counter()  # get weight
-    # if getattr(weight, "_fd_transposed_on_load", False):
-    #     weight._fd_transposed_on_load = False
-    #     return
-    # try:
-    #     weight_place = weight.place
-    # except Exception:
-    #     weight_place = None
-    # if weight_place is not None:
-    in_cpu_place = weight.place in (paddle.CPUPlace(), paddle.CUDAPinnedPlace())
+    # Some loaders already transpose per shard during loading.
+    if getattr(weight, "_fd_transposed_on_load", False):
+        weight._fd_transposed_on_load = False
+        t1 = time.perf_counter()
+        print(
+            f"[process_weight_transpose] {weight_name} | "
+            f"path=skip_already_transposed_on_load | total={((t1 - t0) * 1000):.2f}ms"
+        )
+        return
 
-    if len(weight.shape) == 2:
-        weight_shape = weight.shape[::-1]
-    elif len(weight.shape) == 3:
-        weight_shape = [weight.shape[0]] + list(weight.shape[1:][::-1])
-    weight_tmp = layer.create_parameter(
-        shape=weight_shape,
-        dtype=weight.dtype,
-        device=weight.place,
-        default_initializer=paddle.nn.initializer.Constant(0),
-        is_bias=False,
-    )
-    t2 = time.perf_counter()  # alloc
+    in_host_place = _is_pinned_place(weight) or ("cpu" in str(weight.place).lower())
+    t1 = time.perf_counter()
 
-    if len(weight.shape) == 2:
-        weight_transpose = weight.transpose([1, 0])
-    elif len(weight.shape) == 3:
-        weight_transpose = weight.transpose([0, 2, 1])
-    t3 = time.perf_counter()  # transpose launch
-    # weight_tmp.copy_(weight_transpose, False)
-    if in_cpu_place:
-        param_tensor = weight_tmp.value().get_tensor()
-        weight_transpose_tensor = weight_transpose.value().get_tensor()
-        param_tensor._share_data_with(weight_transpose_tensor)
+    perm, weight_shape = _transpose_meta(weight)
+    t2 = time.perf_counter()
+
+    transpose_path = "gpu_direct"
+    estimated_peak_bytes = 0
+    max_peak_bytes = 0
+
+    if in_host_place:
+        transposed_tensor, transpose_path, estimated_peak_bytes, max_peak_bytes = _try_gpu_fast_host_transpose(
+            weight, perm, debug_mem_log
+        )
+        if transposed_tensor is None:
+            raise RuntimeError(
+                f"process_weight_transpose host path requires gpu_fast, but got path={transpose_path}. "
+                "Set FD_TRANSPOSE_GPU_FAST=1 and ensure GPU budget is sufficient."
+            )
+
+        if debug_mem_log:
+            log_cuda_memory(
+                f"[process_weight_transpose] host path={transpose_path} transposed_place={transposed_tensor.place}"
+            )
+
+        weight_tmp = layer.create_parameter(
+            shape=weight_shape,
+            dtype=weight.dtype,
+            device=transposed_tensor.place,
+            default_initializer=paddle.nn.initializer.Constant(0),
+            is_bias=False,
+        )
+
+        # Keep an explicit reference to backing host tensor; otherwise some
+        # Paddle builds may invalidate guards after temporary tensors are freed.
+        # weight_tmp._fd_host_data_ref = transposed_tensor
+        if _is_pinned_place(transposed_tensor) or getattr(weight, "_fd_cpu_data", None) is not None:
+            weight_tmp._fd_cpu_data = transposed_tensor
+            weight_tmp._fd_gpu_data = None
+
+        weight_tmp.set_value(transposed_tensor)
+        if debug_mem_log:
+            log_cuda_memory(f"[process_weight_transpose] host gpu_fast set_value place={transposed_tensor.place}")
     else:
+        weight_tmp = layer.create_parameter(
+            shape=weight_shape,
+            dtype=weight.dtype,
+            device=weight.place,
+            default_initializer=paddle.nn.initializer.Constant(0),
+            is_bias=False,
+        )
+        weight_transpose = weight.transpose(perm)
         weight_tmp.copy_(weight_transpose, False)
-    t4 = time.perf_counter()  # copy launch
+        if debug_mem_log:
+            log_cuda_memory(f"[process_weight_transpose] gpu_direct place={weight.place}")
+    t3 = time.perf_counter()
+
+    # Keep runtime attrs used by load/offload paths.
+    # for attr_name in (
+    #     "weight_loader",
+    #     "output_dim",
+    #     "weight_need_transpose",
+    #     "tensor_track",
+    #     "tp_row_bias",
+    #     "packed_dim",
+    #     "packed_factor",
+    #     "pack_factor",
+    # ):
+    #     if hasattr(weight, attr_name):
+    #         setattr(weight_tmp, attr_name, getattr(weight, attr_name))
+    t4 = time.perf_counter()
+
     free_tensor(weight)
     setattr(layer, weight_name, weight_tmp)
-
-    t5 = time.perf_counter()  # done
+    t5 = time.perf_counter()
     print(
         f"[process_weight_transpose] {weight_name} | "
-        f"get={((t1-t0)*1000):.2f}ms | "
-        f"alloc={((t2-t1)*1000):.2f}ms | "
-        f"transpose={((t3-t2)*1000):.2f}ms | "
-        f"copy={((t4-t3)*1000):.2f}ms | "
-        f"total={((t5-t0)*1000):.2f}ms"
+        f"path={transpose_path} | "
+        f"est_peak_gb={estimated_peak_bytes / 1024**3:.3f} | "
+        f"peak_budget_gb={max_peak_bytes / 1024**3:.3f} | "
+        f"prep={((t1 - t0) * 1000):.2f}ms | "
+        f"shape={((t2 - t1) * 1000):.2f}ms | "
+        f"transpose_copy={((t3 - t2) * 1000):.2f}ms | "
+        f"attrs={((t4 - t3) * 1000):.2f}ms | "
+        f"finalize={((t5 - t4) * 1000):.2f}ms | "
+        f"total={((t5 - t0) * 1000):.2f}ms"
     )
 
 
@@ -388,31 +631,21 @@ def default_weight_loader(fd_config: FDConfig = None) -> None:
         """fn"""
         output_dim = getattr(param, "output_dim", None)
         weight_need_transpose = getattr(param, "weight_need_transpose", False)
-        try:
-            param_place = param.place
-        except Exception:
-            param_place = None
-        if param_place is None:
-            is_cpu_load = False
+        if hasattr(loaded_weight, "get_shape"):
+            loaded_shape = loaded_weight.get_shape()
         else:
-            place_str = str(param_place).lower()
-            is_cpu_load = ("cpu" in place_str) or ("pinned" in place_str)
-        if not is_cpu_load:
-            if hasattr(loaded_weight, "get_shape"):
-                loaded_shape = loaded_weight.get_shape()
-            else:
-                loaded_shape = loaded_weight.shape
-            if weight_need_transpose:
-                loaded_weight = loaded_weight.transpose([1, 0])
+            loaded_shape = loaded_weight.shape
+        if weight_need_transpose:
+            loaded_weight = loaded_weight.transpose([1, 0])
+            param._fd_transposed_on_load = True
+            param.weight_need_transpose = False
+        elif len(loaded_shape) == 2 and param.shape == loaded_shape[::-1]:
+            loaded_weight = loaded_weight.transpose([1, 0])
+            param._fd_transposed_on_load = True
+        elif len(loaded_shape) == 3 and param.shape[0] == loaded_shape[0]:
+            if param.shape[1] == loaded_shape[2] and param.shape[2] == loaded_shape[1]:
+                loaded_weight = loaded_weight.transpose([0, 2, 1])
                 param._fd_transposed_on_load = True
-                param.weight_need_transpose = False
-            elif len(loaded_shape) == 2 and param.shape == loaded_shape[::-1]:
-                loaded_weight = loaded_weight.transpose([1, 0])
-                param._fd_transposed_on_load = True
-            elif len(loaded_shape) == 3 and param.shape[0] == loaded_shape[0]:
-                if param.shape[1] == loaded_shape[2] and param.shape[2] == loaded_shape[1]:
-                    loaded_weight = loaded_weight.transpose([0, 2, 1])
-                    param._fd_transposed_on_load = True
         # Tensor parallelism splits the weight along the output_dim
         if output_dim is not None and fd_config is not None and fd_config.parallel_config.tensor_parallel_size > 1:
             dim = -1 if output_dim else 0
@@ -504,6 +737,7 @@ def h2d_copy(dst, src, blocking=True):
         # TODO (bukejiyu):A recently merged Paddle PR introduced a hang when copying 1-D non-contiguous tensors. This approach serves as a temporary workaround.
         src = get_tensor(src)
     dst.copy_(src, blocking)
+    _repair_pinned_parent_after_copy(dst)
 
 
 def v1_loader_support(fd_config):
