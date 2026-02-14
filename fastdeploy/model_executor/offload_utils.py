@@ -46,7 +46,6 @@ class _LayerOffloadState:
     pre_hook_handle: object | None = None
     post_hook_handle: object | None = None
     counted_in_total: bool = False
-    partial_offload_logged: bool = False
 
 
 def _bytes_to_gib_str(num_bytes: int) -> str:
@@ -122,8 +121,6 @@ class CPUWeightOffloadManager:
         self.pending_param_offload_bytes = 0
         self._wrapped_param_ids: set[int] = set()
         self.runtime_device_place = None
-        self.partial_offload_watermark_bytes = self._init_partial_offload_watermark_bytes()
-        self.partial_offload_activated = False
 
         self._validate_runtime_support()
 
@@ -150,34 +147,6 @@ class CPUWeightOffloadManager:
                 "offline quantized checkpoint loading is not supported in this version " "(is_checkpoint_bf16=False)"
             )
             return
-
-    @staticmethod
-    def _dtype_num_bytes(dtype) -> int:
-        if dtype is None:
-            return 0
-        dtype_str = str(dtype).lower()
-        mapping = (
-            ("complex128", 16),
-            ("complex64", 8),
-            ("float64", 8),
-            ("int64", 8),
-            ("uint64", 8),
-            ("float32", 4),
-            ("int32", 4),
-            ("uint32", 4),
-            ("bfloat16", 2),
-            ("float16", 2),
-            ("int16", 2),
-            ("uint16", 2),
-            ("float8", 1),
-            ("int8", 1),
-            ("uint8", 1),
-            ("bool", 1),
-        )
-        for key, size in mapping:
-            if key in dtype_str:
-                return size
-        return 0
 
     @staticmethod
     def _tensor_place_to_str(tensor: paddle.Tensor) -> str:
@@ -222,6 +191,34 @@ class CPUWeightOffloadManager:
                 self.runtime_device_place = None
         return self.runtime_device_place
 
+    @staticmethod
+    def _dtype_num_bytes(dtype) -> int:
+        if dtype is None:
+            return 0
+        dtype_str = str(dtype).lower()
+        mapping = (
+            ("complex128", 16),
+            ("complex64", 8),
+            ("float64", 8),
+            ("int64", 8),
+            ("uint64", 8),
+            ("float32", 4),
+            ("int32", 4),
+            ("uint32", 4),
+            ("bfloat16", 2),
+            ("float16", 2),
+            ("int16", 2),
+            ("uint16", 2),
+            ("float8", 1),
+            ("int8", 1),
+            ("uint8", 1),
+            ("bool", 1),
+        )
+        for key, size in mapping:
+            if key in dtype_str:
+                return size
+        return 0
+
     @classmethod
     def _param_num_bytes(cls, param: paddle.Tensor) -> int:
         try:
@@ -231,7 +228,6 @@ class CPUWeightOffloadManager:
                 return numel * elem_size
         except Exception:
             pass
-
         try:
             shape = tuple(param.shape)
             numel = 1
@@ -249,14 +245,7 @@ class CPUWeightOffloadManager:
 
     @staticmethod
     def _get_named_parameters(layer: nn.Layer, include_sublayers: bool) -> dict[str, paddle.Tensor]:
-        try:
-            return dict(layer.named_parameters(include_sublayers=include_sublayers))
-        except TypeError:
-            params = dict(layer.named_parameters())
-            if include_sublayers:
-                return params
-            # Fallback for old paddle versions without include_sublayers argument.
-            return {name: param for name, param in params.items() if "." not in name}
+        return dict(layer.named_parameters(include_sublayers=include_sublayers))
 
     def _register_layer_state(
         self,
@@ -294,29 +283,6 @@ class CPUWeightOffloadManager:
         self.postprocess_owner_cache.clear()
         return True
 
-    def _prepare_fallback_layers_by_direct_params(self, named_sublayers: list[tuple[str, nn.Layer]]) -> int:
-        selected_param_ids = set(self.param_id_to_layer_name.keys())
-        candidates: list[tuple[int, str, nn.Layer, dict[int, paddle.Tensor]]] = []
-        for layer_name, layer in named_sublayers:
-            params = self._get_named_parameters(layer=layer, include_sublayers=False)
-            if len(params) == 0:
-                continue
-            param_id_to_param: dict[int, paddle.Tensor] = {}
-            for param in params.values():
-                param_id = id(param)
-                if param_id in selected_param_ids:
-                    continue
-                self._attach_tensor_track_if_needed(param)
-                param_id_to_param[param_id] = param
-            if len(param_id_to_param) == 0:
-                continue
-            layer_bytes = sum(self._param_num_bytes(param) for param in param_id_to_param.values())
-            if layer_bytes <= 0:
-                continue
-            candidates.append((layer_bytes, layer_name, layer, param_id_to_param))
-
-        return self._register_fallback_candidates(candidates=candidates, source="direct-param-fallback")
-
     def _prepare_fallback_layers_by_param_name(
         self, model: nn.Layer, named_sublayers: list[tuple[str, nn.Layer]]
     ) -> int:
@@ -343,13 +309,6 @@ class CPUWeightOffloadManager:
                 continue
             candidates.append((layer_bytes, layer_name, sublayers_dict[layer_name], param_id_to_param))
 
-        return self._register_fallback_candidates(candidates=candidates, source="param-name-fallback")
-
-    def _register_fallback_candidates(
-        self,
-        candidates: list[tuple[int, str, nn.Layer, dict[int, paddle.Tensor]]],
-        source: str,
-    ) -> int:
         candidates.sort(key=lambda x: x[0], reverse=True)
         selected_cnt = 0
         for layer_bytes, layer_name, layer, param_id_to_param in candidates:
@@ -358,7 +317,7 @@ class CPUWeightOffloadManager:
                 layer=layer,
                 param_id_to_param=param_id_to_param,
                 layer_bytes=layer_bytes,
-                source=source,
+                source="param-name-fallback",
             ):
                 selected_cnt += 1
         return selected_cnt
@@ -426,41 +385,6 @@ class CPUWeightOffloadManager:
                 "weight_loader. Some params may defer offload until finalize."
             )
 
-    def _init_partial_offload_watermark_bytes(self) -> int:
-        if not (current_platform.is_cuda() or current_platform.is_maca()):
-            return 0
-        total_bytes = 0
-        try:
-            mem_info = paddle.device.cuda.mem_get_info()
-            if isinstance(mem_info, (tuple, list)) and len(mem_info) >= 2:
-                total_bytes = int(mem_info[1])
-        except Exception:
-            total_bytes = 0
-        if total_bytes <= 0:
-            return 0
-        gpu_util = float(getattr(self.fd_config.cache_config, "gpu_memory_utilization", 0.9))
-        # Keep partial-param offload as a high-pressure fallback to avoid load-time thrashing.
-        watermark_util = min(0.92, max(0.80, gpu_util - 0.02))
-        return int(total_bytes * watermark_util)
-
-    def _should_offload_partial_param(self) -> bool:
-        if self.partial_offload_watermark_bytes <= 0:
-            return False
-        snapshot = _get_cuda_memory_snapshot()
-        if snapshot is None:
-            return False
-        curr_alloc, curr_reserved, _, _ = snapshot
-        current_used_bytes = int(max(curr_alloc, curr_reserved) * (1024**3))
-        should_offload = current_used_bytes >= self.partial_offload_watermark_bytes
-        if should_offload and not self.partial_offload_activated:
-            self.partial_offload_activated = True
-            logger.warning(
-                f"[cpu-offload] Activate partial-param offload at "
-                f"{_bytes_to_gib_str(current_used_bytes)} "
-                f"(watermark={_bytes_to_gib_str(self.partial_offload_watermark_bytes)})"
-            )
-        return should_offload
-
     def _make_weight_loader_wrapper(self, original_loader):
         def _wrapped(param, loaded_weight, *args, **kwargs):
             self.materialize_param_for_loading(param=param)
@@ -507,10 +431,6 @@ class CPUWeightOffloadManager:
 
         logger.info(f"[cpu-offload] Preparing model CPU weight offload: max={_bytes_to_gib_str(self.max_bytes)}")
         logger.info(f"[cpu-offload] Offload cache place resolved: {self.cpu_place_desc}")
-        if self.partial_offload_watermark_bytes > 0:
-            logger.info(
-                f"[cpu-offload] partial-param watermark={_bytes_to_gib_str(self.partial_offload_watermark_bytes)}"
-            )
         named_sublayers = list(model.named_sublayers())
         decoder_candidate_cnt = 0
         for layer_name, layer in named_sublayers:
@@ -540,14 +460,7 @@ class CPUWeightOffloadManager:
         )
 
         if len(self.layer_states) == 0:
-            logger.warning("[cpu-offload] No decoder layers were selected; " "fallback to parameter-owning sublayers.")
-            selected_fallback = self._prepare_fallback_layers_by_direct_params(named_sublayers=named_sublayers)
-            logger.info(f"[cpu-offload] direct-param fallback selected_layers={selected_fallback}")
-
-        if len(self.layer_states) == 0:
-            logger.warning(
-                "[cpu-offload] Direct-param fallback selected nothing; " "fallback to parameter-name grouping."
-            )
+            logger.warning("[cpu-offload] No decoder layers were selected; fallback to parameter-name grouping.")
             selected_fallback = self._prepare_fallback_layers_by_param_name(
                 model=model, named_sublayers=named_sublayers
             )
@@ -559,6 +472,11 @@ class CPUWeightOffloadManager:
                 f"[cpu-offload] No layers were selected under max budget={_bytes_to_gib_str(self.max_bytes)}. "
                 f"sublayer_sample=[{sample_names}]"
             )
+            if decoder_candidate_cnt > 0:
+                logger.warning(
+                    "[cpu-offload] Decoder candidates exist but none selected. "
+                    "Likely causes: estimated layer bytes are zero or each candidate exceeds remaining budget."
+                )
             return
         self._wrap_layer_weight_loaders()
         self.log_memory(context="after selecting offload layers", force=True)
@@ -572,15 +490,7 @@ class CPUWeightOffloadManager:
         layer_state = self.layer_states[layer_name]
         if self._is_param_fully_loaded(param):
             layer_state.loaded_param_ids.add(id(param))
-        elif not self._should_offload_partial_param():
-            return
-        offloaded_bytes = self._offload_param_if_possible(layer_state=layer_state, param=param)
-        if offloaded_bytes > 0 and not layer_state.partial_offload_logged:
-            logger.info(
-                f"[cpu-offload] Start param-level offload for {layer_state.name}, "
-                f"cached_params={len(layer_state.cpu_param_cache)}/{len(layer_state.param_id_to_param)}"
-            )
-            layer_state.partial_offload_logged = True
+        self._offload_param_if_possible(layer_state=layer_state, param=param)
         if len(layer_state.loaded_param_ids) == len(layer_state.param_id_to_param):
             self._mark_layer_fully_offloaded(layer_state=layer_state, reason="all-params-loaded")
 
