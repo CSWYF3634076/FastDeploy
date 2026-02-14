@@ -113,6 +113,7 @@ class CPUWeightOffloadManager:
         self.next_reserved_log_step = _MEMORY_GROWTH_LOG_STEP_BYTES
         self.pending_param_offload_bytes = 0
         self._wrapped_param_ids: set[int] = set()
+        self.runtime_device_place = None
         self.partial_offload_watermark_bytes = self._init_partial_offload_watermark_bytes()
         self.partial_offload_activated = False
 
@@ -187,6 +188,13 @@ class CPUWeightOffloadManager:
             return "unknown-tensor-place"
 
     @staticmethod
+    def _is_pinned_place_str(place_name: str) -> bool:
+        if not place_name:
+            return False
+        normalized = place_name.lower().replace(" ", "")
+        return "gpu_pinned" in normalized or "gpupinned" in normalized or "cudapinnedplace" in normalized
+
+    @staticmethod
     def _init_offload_cache_place():
         if not (current_platform.is_cuda() or current_platform.is_maca()):
             raise RuntimeError("[cpu-offload] CUDAPinnedPlace is required, but current platform is not CUDA/Metax.")
@@ -196,6 +204,26 @@ class CPUWeightOffloadManager:
             return place
         except Exception as ex:
             raise RuntimeError(f"[cpu-offload] CUDAPinnedPlace is required but unavailable: {ex}") from ex
+
+    def _resolve_runtime_device_place(self):
+        if self.runtime_device_place is not None:
+            return self.runtime_device_place
+        try:
+            device = str(paddle.device.get_device()).lower()
+        except Exception:
+            device = "gpu:0"
+        if device.startswith("gpu"):
+            device_id = 0
+            if ":" in device:
+                try:
+                    device_id = int(device.split(":", 1)[1])
+                except Exception:
+                    device_id = 0
+            try:
+                self.runtime_device_place = paddle.CUDAPlace(device_id)
+            except Exception:
+                self.runtime_device_place = None
+        return self.runtime_device_place
 
     @classmethod
     def _param_num_bytes(cls, param: paddle.Tensor) -> int:
@@ -597,11 +625,15 @@ class CPUWeightOffloadManager:
         total_hits = 0
         for place_name, count in self.cache_tensor_place_counter.items():
             total_hits += count
-            if "CUDAPinnedPlace" in place_name:
+            if self._is_pinned_place_str(place_name):
                 pinned_hits += count
+        target_is_pinned = self._is_pinned_place_str(self.cpu_place_desc)
+        effective_pinned = pinned_hits == total_hits and total_hits > 0
         logger.info(
             f"[cpu-offload] [{context}] cache_place_target={self.cpu_place_desc}; "
-            f"cache_place_stats={place_items}; pinned_hits={pinned_hits}/{total_hits}"
+            f"target_is_pinned={target_is_pinned}; "
+            f"cache_place_stats={place_items}; pinned_hits={pinned_hits}/{total_hits}; "
+            f"all_cached_tensors_pinned={effective_pinned}"
         )
 
     def _resolve_layer_state_for_sublayer(self, sublayer_name: str) -> _LayerOffloadState | None:
@@ -742,12 +774,12 @@ class CPUWeightOffloadManager:
 
     def _build_post_hook(self, layer_state: _LayerOffloadState):
         def _post_hook(layer, inputs, outputs):
-            for param_id in layer_state.cpu_param_cache.keys():
+            for param_id, cpu_tensor in layer_state.cpu_param_cache.items():
                 param = layer_state.param_id_to_param.get(param_id)
                 if param is None:
                     continue
-                if hasattr(param, "_is_initialized") and param._is_initialized():
-                    param._clear_data()
+                self._bind_param_to_tensor(param=param, source_tensor=cpu_tensor, context=layer_state.name)
+                self._clear_runtime_gpu_cache(param=param)
             layer_state.post_hook_calls += 1
             if layer_state.post_hook_calls <= 3:
                 self.log_memory(
@@ -759,10 +791,58 @@ class CPUWeightOffloadManager:
         return _post_hook
 
     @staticmethod
-    def _materialize_single_param(param: paddle.Tensor, cpu_tensor: paddle.Tensor, context: str) -> None:
-        if cpu_tensor is None:
+    def _clear_runtime_gpu_cache(param: paddle.Tensor) -> None:
+        gpu_tensor = getattr(param, "_fd_runtime_gpu_data", None)
+        if gpu_tensor is None:
             return
         try:
+            gpu_tensor.value().get_tensor()._clear()
+        except Exception:
+            pass
+        try:
+            param._fd_runtime_gpu_data = None
+        except Exception:
+            pass
+
+    @staticmethod
+    def _bind_param_to_tensor(param: paddle.Tensor, source_tensor: paddle.Tensor, context: str) -> bool:
+        if source_tensor is None:
+            return False
+        try:
+            if hasattr(param, "_is_initialized") and not param._is_initialized():
+                param.initialize()
+        except Exception:
+            pass
+        try:
+            param.value().get_tensor()._share_data_with(source_tensor.value().get_tensor())
+            return True
+        except Exception:
+            pass
+        try:
+            param.set_value(source_tensor)
+            return True
+        except Exception as ex:
+            logger.warning(f"[cpu-offload] Failed to bind param tensor for {context}: {ex}")
+            return False
+
+    def _materialize_single_param(self, param: paddle.Tensor, cpu_tensor: paddle.Tensor, context: str) -> None:
+        if cpu_tensor is None:
+            return
+        runtime_place = self._resolve_runtime_device_place()
+        if runtime_place is not None:
+            try:
+                gpu_tensor = cpu_tensor._copy_to(runtime_place, True)
+                if self._bind_param_to_tensor(param=param, source_tensor=gpu_tensor, context=context):
+                    try:
+                        param._fd_runtime_gpu_data = gpu_tensor
+                    except Exception:
+                        pass
+                    return
+            except Exception:
+                pass
+        try:
+            if hasattr(param, "_is_initialized") and param._is_initialized():
+                param._clear_data()
             if hasattr(param, "_is_initialized") and not param._is_initialized():
                 param.initialize()
         except Exception:
@@ -772,11 +852,7 @@ class CPUWeightOffloadManager:
             return
         except Exception:
             pass
-        try:
-            param.set_value(cpu_tensor)
-            return
-        except Exception as ex:
-            logger.warning(f"[cpu-offload] Failed to materialize param for {context}: {ex}")
+        self._bind_param_to_tensor(param=param, source_tensor=cpu_tensor, context=context)
 
     def _offload_param_if_possible(self, layer_state: _LayerOffloadState, param: paddle.Tensor) -> int:
         param_id = id(param)
@@ -801,10 +877,8 @@ class CPUWeightOffloadManager:
             self.cache_tensor_place_log_count += 1
         offloaded_bytes = self._param_num_bytes(param)
         layer_state.param_offloaded_bytes += offloaded_bytes
-        try:
-            param._clear_data()
-        except Exception:
-            pass
+        self._bind_param_to_tensor(param=param, source_tensor=cpu_tensor, context=f"{layer_state.name}/offload")
+        self._clear_runtime_gpu_cache(param=param)
         self.pending_param_offload_bytes += offloaded_bytes
         if self.pending_param_offload_bytes >= _PARAM_OFFLOAD_EMPTY_CACHE_STEP_BYTES and (
             current_platform.is_cuda() or current_platform.is_maca()
