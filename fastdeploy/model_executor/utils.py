@@ -166,14 +166,23 @@ def process_weights_after_loading(sublayers_dict: dict, fd_config: FDConfig):
             UnquantizedLinearMethod,
         )
         from fastdeploy.model_executor.layers.moe.moe import get_moe_method
+        from fastdeploy.model_executor.offload_utils import (
+            maybe_offload_layer_after_weight_loading,
+        )
+
+        def _maybe_offload_param() -> None:
+            if param is not None:
+                maybe_offload_layer_after_weight_loading(param)
 
         if model_sublayer_name not in sublayers_dict:
+            # _maybe_offload_param()
             return
         model_sublayer = sublayers_dict[model_sublayer_name]
         if isinstance(model_sublayer, KVBatchLinear):
             model_sublayer.process_weights_after_loading()
         if fd_config.quant_config and not fd_config.quant_config.is_checkpoint_bf16:
             # skip for offline quantization
+            # _maybe_offload_param()
             return
         if hasattr(model_sublayer, "quant_method"):
             quant_method = getattr(model_sublayer, "quant_method", None)
@@ -184,14 +193,19 @@ def process_weights_after_loading(sublayers_dict: dict, fd_config: FDConfig):
                 unquant_moe_cls = type(unquant_moe_layer)
             if type(quant_method) is UnquantizedLinearMethod or type(quant_method) is unquant_moe_cls:
                 # skip unquantized linear
+                # _maybe_offload_param()
                 return
             if not hasattr(quant_method, "process_weights_after_loading"):
+                # _maybe_offload_param()
                 return
             if param is not None and hasattr(param, "tensor_track") and param.tensor_track is None:
+                # _maybe_offload_param()
                 return
             if param is not None and hasattr(param, "tensor_track") and not param.tensor_track.is_fully_copied():
+                # _maybe_offload_param()
                 return
             quant_method.process_weights_after_loading(model_sublayer)
+        _maybe_offload_param()
 
     return fn
 
@@ -249,26 +263,44 @@ def process_final_after_loading(model, fd_config: FDConfig):
         UnquantizedLinearMethod,
     )
     from fastdeploy.model_executor.layers.moe.moe import get_moe_method
+    from fastdeploy.model_executor.offload_utils import (
+        get_cpu_offload_postprocess_owner,
+        maybe_materialize_layer_for_postprocess,
+        maybe_reoffload_layer_after_postprocess,
+    )
 
-    for name, sublayer in model.named_sublayers():
-        if isinstance(sublayer, KVBatchLinear):
-            continue
-        quant_method = getattr(sublayer, "quant_method", None)
-        if quant_method is not None:
-            unquant_moe_layer = get_moe_method()
-            if unquant_moe_layer is None:
-                unquant_moe_cls = object
-            else:
-                unquant_moe_cls = type(unquant_moe_layer)
-            is_unquant_cls = type(quant_method) is UnquantizedLinearMethod or type(quant_method) is unquant_moe_cls
-            is_offline_quantized_ckpt = not (fd_config.quant_config and fd_config.quant_config.is_checkpoint_bf16)
-            if is_unquant_cls or is_offline_quantized_ckpt:
-                if hasattr(quant_method, "process_weights_after_loading"):
-                    quant_method.process_weights_after_loading(sublayer)
+    current_owner = None
+    try:
+        for name, sublayer in model.named_sublayers():
+            owner = get_cpu_offload_postprocess_owner(name)
+            if owner != current_owner:
+                if current_owner is not None:
+                    maybe_reoffload_layer_after_postprocess(current_owner)
+                if owner is not None:
+                    maybe_materialize_layer_for_postprocess(owner)
+                current_owner = owner
+
+            if isinstance(sublayer, KVBatchLinear):
                 continue
-        if not hasattr(sublayer, "process_weights_after_loading"):
-            continue
-        sublayer.process_weights_after_loading()
+            quant_method = getattr(sublayer, "quant_method", None)
+            if quant_method is not None:
+                unquant_moe_layer = get_moe_method()
+                if unquant_moe_layer is None:
+                    unquant_moe_cls = object
+                else:
+                    unquant_moe_cls = type(unquant_moe_layer)
+                is_unquant_cls = type(quant_method) is UnquantizedLinearMethod or type(quant_method) is unquant_moe_cls
+                is_offline_quantized_ckpt = not (fd_config.quant_config and fd_config.quant_config.is_checkpoint_bf16)
+                if is_unquant_cls or is_offline_quantized_ckpt:
+                    if hasattr(quant_method, "process_weights_after_loading"):
+                        quant_method.process_weights_after_loading(sublayer)
+                    continue
+            if not hasattr(sublayer, "process_weights_after_loading"):
+                continue
+            sublayer.process_weights_after_loading()
+    finally:
+        if current_owner is not None:
+            maybe_reoffload_layer_after_postprocess(current_owner)
 
 
 def free_tensor(tensor):
@@ -313,6 +345,11 @@ def default_weight_loader(fd_config: FDConfig = None) -> None:
 
     def fn(param, loaded_weight, shard_id: Optional[Union[int, str]] = None):
         """fn"""
+        from fastdeploy.model_executor.offload_utils import (
+            maybe_materialize_param_for_loading,
+        )
+
+        maybe_materialize_param_for_loading(param)
         output_dim = getattr(param, "output_dim", None)
         weight_need_transpose = getattr(param, "weight_need_transpose", False)
         if weight_need_transpose:

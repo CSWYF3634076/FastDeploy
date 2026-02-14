@@ -1017,6 +1017,14 @@ def parse_args():
         help="Number of cpu blocks.",
     )
     parser.add_argument(
+        "--cpu_offload_gb",
+        "--cpu-offload-gb",
+        dest="cpu_offload_gb",
+        type=float,
+        default=0.0,
+        help="CPU weight offload size in GiB per GPU rank.",
+    )
+    parser.add_argument(
         "--kvcache_storage_backend",
         type=str,
         help="KVCache storage backend.",

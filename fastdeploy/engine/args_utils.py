@@ -240,6 +240,10 @@ class EngineArgs:
     """
     The amount of CPU memory to offload to.
     """
+    cpu_offload_gb: float = 0
+    """
+    The amount of CPU memory (GiB) for weight offloading per GPU.
+    """
 
     cache_queue_port: Optional[Union[int, str, list]] = None
     """
@@ -1065,6 +1069,12 @@ class EngineArgs:
 
         cache_group.add_argument(
             "--swap-space", type=float, default=EngineArgs.swap_space, help="The amount of CPU memory to offload to."
+        )
+        cache_group.add_argument(
+            "--cpu-offload-gb",
+            type=float,
+            default=EngineArgs.cpu_offload_gb,
+            help="CPU weight offload size in GiB per GPU rank.",
         )
 
         cache_group.add_argument(

@@ -30,6 +30,12 @@ from fastdeploy.model_executor.load_weight_utils import (
 from fastdeploy.model_executor.model_loader.base_loader import BaseModelLoader
 from fastdeploy.model_executor.models.adapters import as_embedding_model
 from fastdeploy.model_executor.models.model_base import ModelRegistry
+from fastdeploy.model_executor.offload_utils import (
+    finalize_cpu_weight_offload,
+    log_cpu_offload_memory,
+    log_model_parameter_place_stats,
+    prepare_model_cpu_weight_offload,
+)
 from fastdeploy.model_executor.utils import process_final_after_loading
 from fastdeploy.platforms import current_platform
 
@@ -54,12 +60,21 @@ class DefaultModelLoaderV1(BaseModelLoader):
     def load_weights(self, model, fd_config: FDConfig, enable_cache: bool = False) -> None:
         model_path = get_model_path(fd_config)
         weights_iterator = get_weight_iterator(model_path)
+        log_cpu_offload_memory("before default_v1 weight loading", force=True)
         if enable_cache:
             load_weights_from_cache(model, weights_iterator)
         else:
             model.load_weights(weights_iterator)
+        # Offload immediately after loading to avoid peak memory before post-processing.
+        finalize_cpu_weight_offload()
+        log_cpu_offload_memory("after default_v1 weight loading before post-process", force=True)
         # Execute post-processing after weight loading
         process_final_after_loading(model, fd_config)
+        log_model_parameter_place_stats(model, context="after process_final_after_loading")
+        # Best effort to re-offload in case post-processing materializes any layer parameters.
+        finalize_cpu_weight_offload()
+        log_model_parameter_place_stats(model, context="after finalize_cpu_weight_offload()")
+        log_cpu_offload_memory("after default_v1 weight loading", force=True)
 
         self.clean_memory_fragments()
 
@@ -91,6 +106,7 @@ class DefaultModelLoaderV1(BaseModelLoader):
                     assert_never(convert_type)
 
                 model = model_cls(fd_config)
+                prepare_model_cpu_weight_offload(model=model, fd_config=fd_config)
                 if fd_config.load_config.dynamic_load_weight or fd_config.model_config.enable_cache:
                     process_final_after_loading(model, fd_config)
 

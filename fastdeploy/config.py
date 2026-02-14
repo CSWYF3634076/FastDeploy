@@ -1386,6 +1386,7 @@ class CacheConfig:
         self.cache_queue_port = None
         self.local_cache_queue_port = None
         self.swap_space = None
+        self.cpu_offload_gb = 0
         self.max_encoder_cache = None
         self.max_processor_cache = None
         self.enable_output_caching = False
@@ -1455,6 +1456,8 @@ class CacheConfig:
             raise ValueError("GPU memory utilization must be less than 1.0. Got " f"{self.gpu_memory_utilization}.")
         if self.kv_cache_ratio > 1.0:
             raise ValueError("KV cache ratio must be less than 1.0. Got " f"{self.kv_cache_ratio}.")
+        if self.cpu_offload_gb < 0:
+            raise ValueError("CPU offload size must be >= 0. Got " f"{self.cpu_offload_gb}.")
 
     def postprocess(self, num_total_tokens, number_of_tasks):
         """
@@ -1888,6 +1891,13 @@ class FDConfig:
             self.graph_opt_config.graph_opt_level = 0
             logger.info(
                 "Static Graph does not support to be started together with RL Training, and automatically switch to dynamic graph!"
+            )
+
+        if self.cache_config.cpu_offload_gb > 0 and self.graph_opt_config.use_cudagraph:
+            self.graph_opt_config.use_cudagraph = False
+            logger.warning(
+                f"Disable CUDAGraph because cpu_offload_gb={self.cache_config.cpu_offload_gb} is enabled. "
+                "CPU weight offload requires dynamic parameter materialization."
             )
 
         if not current_platform.is_cuda() and not current_platform.is_maca() and not current_platform.is_xpu():
