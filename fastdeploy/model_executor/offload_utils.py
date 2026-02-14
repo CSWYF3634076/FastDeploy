@@ -30,7 +30,6 @@ from fastdeploy.platforms import current_platform
 _DECODER_LAYER_NAME_PATTERN = re.compile(r"(?:^|[.])(layers|mtp_block|h|blocks|block)[.]\d+$")
 _MEMORY_GROWTH_LOG_STEP_BYTES = 1 << 30
 
-_CPU_OFFLOAD_MAX_BYTES = 0
 _CPU_WEIGHT_OFFLOAD_MANAGER = None
 _PARAM_OFFLOAD_EMPTY_CACHE_STEP_BYTES = 256 << 20
 
@@ -46,10 +45,7 @@ class _LayerOffloadState:
     offloaded: bool = False
     pre_hook_handle: object | None = None
     post_hook_handle: object | None = None
-    pre_hook_calls: int = 0
-    post_hook_calls: int = 0
     counted_in_total: bool = False
-    param_offloaded_bytes: int = 0
     partial_offload_logged: bool = False
 
 
@@ -79,7 +75,7 @@ def _get_cuda_memory_snapshot() -> tuple[float, float, float, float] | None:
 
 
 def log_cpu_offload_memory(context: str, force: bool = True) -> None:
-    manager = _CPU_WEIGHT_OFFLOAD_MANAGER
+    manager = _get_cpu_weight_offload_manager()
     if manager is not None:
         manager.log_memory(context=context, force=force)
         return
@@ -94,6 +90,19 @@ def log_cpu_offload_memory(context: str, force: bool = True) -> None:
     )
 
 
+def _get_cpu_weight_offload_manager():
+    return _CPU_WEIGHT_OFFLOAD_MANAGER
+
+
+def _try_empty_cache() -> None:
+    if not (current_platform.is_cuda() or current_platform.is_maca()):
+        return
+    try:
+        paddle.device.cuda.empty_cache()
+    except Exception:
+        pass
+
+
 class CPUWeightOffloadManager:
     def __init__(self, max_bytes: int, fd_config: FDConfig) -> None:
         self.max_bytes = max(0, int(max_bytes))
@@ -106,9 +115,8 @@ class CPUWeightOffloadManager:
         self.param_id_to_layer_name: dict[int, str] = {}
         self.postprocess_owner_cache: dict[str, str | None] = {}
         self.cpu_place = self._init_offload_cache_place()
-        self.cpu_place_desc = self._place_to_str(self.cpu_place)
+        self.cpu_place_desc = str(self.cpu_place)
         self.cache_tensor_place_counter: dict[str, int] = {}
-        self.cache_tensor_place_log_count = 0
         self.next_alloc_log_step = _MEMORY_GROWTH_LOG_STEP_BYTES
         self.next_reserved_log_step = _MEMORY_GROWTH_LOG_STEP_BYTES
         self.pending_param_offload_bytes = 0
@@ -172,20 +180,10 @@ class CPUWeightOffloadManager:
         return 0
 
     @staticmethod
-    def _place_to_str(place_obj) -> str:
-        try:
-            return str(place_obj)
-        except Exception:
-            return "unknown-place"
-
-    @staticmethod
     def _tensor_place_to_str(tensor: paddle.Tensor) -> str:
         if tensor is None:
             return "none"
-        try:
-            return str(tensor.place)
-        except Exception:
-            return "unknown-tensor-place"
+        return str(tensor.place)
 
     @staticmethod
     def _is_pinned_place_str(place_name: str) -> bool:
@@ -215,10 +213,9 @@ class CPUWeightOffloadManager:
         if device.startswith("gpu"):
             device_id = 0
             if ":" in device:
-                try:
-                    device_id = int(device.split(":", 1)[1])
-                except Exception:
-                    device_id = 0
+                device_suffix = device.split(":", 1)[1]
+                if device_suffix.isdigit():
+                    device_id = int(device_suffix)
             try:
                 self.runtime_device_place = paddle.CUDAPlace(device_id)
             except Exception:
@@ -318,18 +315,7 @@ class CPUWeightOffloadManager:
                 continue
             candidates.append((layer_bytes, layer_name, layer, param_id_to_param))
 
-        candidates.sort(key=lambda x: x[0], reverse=True)
-        selected_cnt = 0
-        for layer_bytes, layer_name, layer, param_id_to_param in candidates:
-            if self._register_layer_state(
-                layer_name=layer_name,
-                layer=layer,
-                param_id_to_param=param_id_to_param,
-                layer_bytes=layer_bytes,
-                source="direct-param-fallback",
-            ):
-                selected_cnt += 1
-        return selected_cnt
+        return self._register_fallback_candidates(candidates=candidates, source="direct-param-fallback")
 
     def _prepare_fallback_layers_by_param_name(
         self, model: nn.Layer, named_sublayers: list[tuple[str, nn.Layer]]
@@ -357,6 +343,13 @@ class CPUWeightOffloadManager:
                 continue
             candidates.append((layer_bytes, layer_name, sublayers_dict[layer_name], param_id_to_param))
 
+        return self._register_fallback_candidates(candidates=candidates, source="param-name-fallback")
+
+    def _register_fallback_candidates(
+        self,
+        candidates: list[tuple[int, str, nn.Layer, dict[int, paddle.Tensor]]],
+        source: str,
+    ) -> int:
         candidates.sort(key=lambda x: x[0], reverse=True)
         selected_cnt = 0
         for layer_bytes, layer_name, layer, param_id_to_param in candidates:
@@ -365,7 +358,7 @@ class CPUWeightOffloadManager:
                 layer=layer,
                 param_id_to_param=param_id_to_param,
                 layer_bytes=layer_bytes,
-                source="param-name-fallback",
+                source=source,
             ):
                 selected_cnt += 1
         return selected_cnt
@@ -738,11 +731,7 @@ class CPUWeightOffloadManager:
                 layer_state=layer_state, reason=reason, offloaded_this_layer=offloaded_this_layer
             )
         elif offloaded_this_layer > 0:
-            if current_platform.is_cuda() or current_platform.is_maca():
-                try:
-                    paddle.device.cuda.empty_cache()
-                except Exception:
-                    pass
+            _try_empty_cache()
             self.log_memory(context=f"after partial offloading {layer_state.name}", force=False)
 
     def _ensure_layer_hooks(self, layer_state: _LayerOffloadState) -> None:
@@ -762,12 +751,6 @@ class CPUWeightOffloadManager:
                 if cpu_tensor is None:
                     continue
                 self._materialize_single_param(param=param, cpu_tensor=cpu_tensor, context=layer_state.name)
-            layer_state.pre_hook_calls += 1
-            if layer_state.pre_hook_calls <= 3:
-                self.log_memory(
-                    context=f"runtime pre-hook materialize {layer_state.name} ({layer_state.pre_hook_calls})",
-                    force=False,
-                )
             return None
 
         return _pre_hook
@@ -780,12 +763,6 @@ class CPUWeightOffloadManager:
                     continue
                 self._bind_param_to_tensor(param=param, source_tensor=cpu_tensor, context=layer_state.name)
                 self._clear_runtime_gpu_cache(param=param)
-            layer_state.post_hook_calls += 1
-            if layer_state.post_hook_calls <= 3:
-                self.log_memory(
-                    context=f"runtime post-hook evict {layer_state.name} ({layer_state.post_hook_calls})",
-                    force=False,
-                )
             return outputs
 
         return _post_hook
@@ -799,10 +776,7 @@ class CPUWeightOffloadManager:
             gpu_tensor.value().get_tensor()._clear()
         except Exception:
             pass
-        try:
-            param._fd_runtime_gpu_data = None
-        except Exception:
-            pass
+        param._fd_runtime_gpu_data = None
 
     @staticmethod
     def _bind_param_to_tensor(param: paddle.Tensor, source_tensor: paddle.Tensor, context: str) -> bool:
@@ -833,10 +807,7 @@ class CPUWeightOffloadManager:
             try:
                 gpu_tensor = cpu_tensor._copy_to(runtime_place, True)
                 if self._bind_param_to_tensor(param=param, source_tensor=gpu_tensor, context=context):
-                    try:
-                        param._fd_runtime_gpu_data = gpu_tensor
-                    except Exception:
-                        pass
+                    param._fd_runtime_gpu_data = gpu_tensor
                     return
             except Exception:
                 pass
@@ -869,24 +840,12 @@ class CPUWeightOffloadManager:
         layer_state.cpu_param_cache[param_id] = cpu_tensor
         cache_place = self._tensor_place_to_str(cpu_tensor)
         self.cache_tensor_place_counter[cache_place] = self.cache_tensor_place_counter.get(cache_place, 0) + 1
-        if self.cache_tensor_place_log_count < 8:
-            logger.info(
-                f"[cpu-offload] cached tensor place sample: "
-                f"layer={layer_state.name} cache_place={cache_place} target_place={self.cpu_place_desc}"
-            )
-            self.cache_tensor_place_log_count += 1
         offloaded_bytes = self._param_num_bytes(param)
-        layer_state.param_offloaded_bytes += offloaded_bytes
         self._bind_param_to_tensor(param=param, source_tensor=cpu_tensor, context=f"{layer_state.name}/offload")
         self._clear_runtime_gpu_cache(param=param)
         self.pending_param_offload_bytes += offloaded_bytes
-        if self.pending_param_offload_bytes >= _PARAM_OFFLOAD_EMPTY_CACHE_STEP_BYTES and (
-            current_platform.is_cuda() or current_platform.is_maca()
-        ):
-            try:
-                paddle.device.cuda.empty_cache()
-            except Exception:
-                pass
+        if self.pending_param_offload_bytes >= _PARAM_OFFLOAD_EMPTY_CACHE_STEP_BYTES:
+            _try_empty_cache()
             self.pending_param_offload_bytes = 0
             self.log_memory(context=f"after param-level offload {layer_state.name}", force=False)
         self._ensure_layer_hooks(layer_state=layer_state)
@@ -902,11 +861,7 @@ class CPUWeightOffloadManager:
         if not layer_state.counted_in_total:
             self.total_offloaded_bytes += layer_state.total_bytes
             layer_state.counted_in_total = True
-        if current_platform.is_cuda() or current_platform.is_maca():
-            try:
-                paddle.device.cuda.empty_cache()
-            except Exception:
-                pass
+        _try_empty_cache()
         logger.info(
             f"[cpu-offload] Offloaded layer {layer_state.name} "
             f"({_bytes_to_gib_str(layer_state.total_bytes)}), reason={reason}, "
@@ -917,82 +872,54 @@ class CPUWeightOffloadManager:
 
 
 def prepare_model_cpu_weight_offload(model: nn.Layer, fd_config: FDConfig) -> None:
-    global _CPU_WEIGHT_OFFLOAD_MANAGER, _CPU_OFFLOAD_MAX_BYTES
-    _CPU_OFFLOAD_MAX_BYTES = max(0, int(fd_config.cache_config.cpu_offload_gb * 1024**3))
-    if _CPU_OFFLOAD_MAX_BYTES <= 0:
+    global _CPU_WEIGHT_OFFLOAD_MANAGER
+    max_bytes = max(0, int(fd_config.cache_config.cpu_offload_gb * 1024**3))
+    if max_bytes <= 0:
         _CPU_WEIGHT_OFFLOAD_MANAGER = None
         return
-    manager = CPUWeightOffloadManager(max_bytes=_CPU_OFFLOAD_MAX_BYTES, fd_config=fd_config)
+    manager = CPUWeightOffloadManager(max_bytes=max_bytes, fd_config=fd_config)
     _CPU_WEIGHT_OFFLOAD_MANAGER = manager
     manager.prepare_model(model=model)
 
 
 def maybe_offload_layer_after_weight_loading(param: paddle.Tensor) -> None:
-    manager = _CPU_WEIGHT_OFFLOAD_MANAGER
+    manager = _get_cpu_weight_offload_manager()
     if manager is None:
         return
     manager.on_parameter_loaded(param=param)
 
 
 def maybe_materialize_param_for_loading(param: paddle.Tensor) -> None:
-    manager = _CPU_WEIGHT_OFFLOAD_MANAGER
+    manager = _get_cpu_weight_offload_manager()
     if manager is None:
         return
     manager.materialize_param_for_loading(param=param)
 
 
 def finalize_cpu_weight_offload() -> None:
-    manager = _CPU_WEIGHT_OFFLOAD_MANAGER
+    manager = _get_cpu_weight_offload_manager()
     if manager is None:
         return
     manager.finalize_after_weight_loading()
     manager.log_cached_tensor_place_stats(context="after finalize_cpu_weight_offload()")
 
 
-def log_model_parameter_place_stats(model: nn.Layer, context: str, sample_limit: int = 12) -> None:
-    manager = _CPU_WEIGHT_OFFLOAD_MANAGER
-    target_place = manager.cpu_place_desc if manager is not None else "offload-manager-none"
-    place_counter: dict[str, int] = {}
-    samples: list[str] = []
-    total_params = 0
-    for param_name, param in model.named_parameters():
-        total_params += 1
-        try:
-            if hasattr(param, "_is_initialized") and not param._is_initialized():
-                place_name = "uninitialized"
-            else:
-                place_name = str(param.place)
-        except Exception as ex:
-            place_name = f"no-memory:{type(ex).__name__}"
-        place_counter[place_name] = place_counter.get(place_name, 0) + 1
-        if len(samples) < sample_limit:
-            samples.append(f"{param_name}=>{place_name}")
-
-    place_items = ", ".join(f"{name}:{count}" for name, count in sorted(place_counter.items()))
-    logger.info(
-        f"[cpu-offload] [{context}] model parameter places: total={total_params}; "
-        f"offload_cache_target={target_place}; stats={place_items}"
-    )
-    if len(samples) > 0:
-        logger.info(f"[cpu-offload] [{context}] model parameter place samples: {' | '.join(samples)}")
-
-
 def maybe_materialize_layer_for_postprocess(layer_name: str) -> None:
-    manager = _CPU_WEIGHT_OFFLOAD_MANAGER
+    manager = _get_cpu_weight_offload_manager()
     if manager is None:
         return
     manager.materialize_layer_for_postprocess(sublayer_name=layer_name)
 
 
 def maybe_reoffload_layer_after_postprocess(layer_name: str) -> None:
-    manager = _CPU_WEIGHT_OFFLOAD_MANAGER
+    manager = _get_cpu_weight_offload_manager()
     if manager is None:
         return
     manager.reoffload_layer_after_postprocess(sublayer_name=layer_name)
 
 
 def get_cpu_offload_postprocess_owner(layer_name: str) -> str | None:
-    manager = _CPU_WEIGHT_OFFLOAD_MANAGER
+    manager = _get_cpu_weight_offload_manager()
     if manager is None:
         return None
     return manager.resolve_postprocess_owner_name(sublayer_name=layer_name)

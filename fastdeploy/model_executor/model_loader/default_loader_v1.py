@@ -33,7 +33,6 @@ from fastdeploy.model_executor.models.model_base import ModelRegistry
 from fastdeploy.model_executor.offload_utils import (
     finalize_cpu_weight_offload,
     log_cpu_offload_memory,
-    log_model_parameter_place_stats,
     prepare_model_cpu_weight_offload,
 )
 from fastdeploy.model_executor.utils import process_final_after_loading
@@ -70,10 +69,8 @@ class DefaultModelLoaderV1(BaseModelLoader):
         log_cpu_offload_memory("after default_v1 weight loading before post-process", force=True)
         # Execute post-processing after weight loading
         process_final_after_loading(model, fd_config)
-        log_model_parameter_place_stats(model, context="after process_final_after_loading")
         # Best effort to re-offload in case post-processing materializes any layer parameters.
         finalize_cpu_weight_offload()
-        log_model_parameter_place_stats(model, context="after finalize_cpu_weight_offload()")
         log_cpu_offload_memory("after default_v1 weight loading", force=True)
 
         self.clean_memory_fragments()
