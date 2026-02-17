@@ -488,8 +488,9 @@ class CPUWeightOffloadManager:
         if layer_name is None:
             return
         layer_state = self.layer_states[layer_name]
-        if self._is_param_fully_loaded(param):
-            layer_state.loaded_param_ids.add(id(param))
+        if not self._is_param_fully_loaded(param):
+            return
+        layer_state.loaded_param_ids.add(id(param))
         self._offload_param_if_possible(layer_state=layer_state, param=param)
         if len(layer_state.loaded_param_ids) == len(layer_state.param_id_to_param):
             self._mark_layer_fully_offloaded(layer_state=layer_state, reason="all-params-loaded")
@@ -692,11 +693,8 @@ class CPUWeightOffloadManager:
     def _bind_param_to_tensor(param: paddle.Tensor, source_tensor: paddle.Tensor, context: str) -> bool:
         if source_tensor is None:
             return False
-        try:
-            if hasattr(param, "_is_initialized") and not param._is_initialized():
-                param.initialize()
-        except Exception:
-            pass
+        if hasattr(param, "_is_initialized") and not param._is_initialized():
+            param.initialize()
         try:
             param.value().get_tensor()._share_data_with(source_tensor.value().get_tensor())
             return True
@@ -714,20 +712,19 @@ class CPUWeightOffloadManager:
             return
         runtime_place = self._resolve_runtime_device_place()
         if runtime_place is not None:
-            try:
-                gpu_tensor = cpu_tensor._copy_to(runtime_place, True)
-                if self._bind_param_to_tensor(param=param, source_tensor=gpu_tensor, context=context):
-                    param._fd_runtime_gpu_data = gpu_tensor
-                    return
-            except Exception:
-                pass
-        try:
-            if hasattr(param, "_is_initialized") and param._is_initialized():
-                param._clear_data()
-            if hasattr(param, "_is_initialized") and not param._is_initialized():
-                param.initialize()
-        except Exception:
-            pass
+
+            gpu_tensor = cpu_tensor._copy_to(runtime_place, True)
+
+            if gpu_tensor is not None and self._bind_param_to_tensor(
+                param=param, source_tensor=gpu_tensor, context=context
+            ):
+                param._fd_runtime_gpu_data = gpu_tensor
+                return
+
+        if hasattr(param, "_is_initialized") and param._is_initialized():
+            param._clear_data()
+        if hasattr(param, "_is_initialized") and not param._is_initialized():
+            param.initialize()
         try:
             param.copy_(cpu_tensor, True)
             return
@@ -741,12 +738,10 @@ class CPUWeightOffloadManager:
             return 0
         if not hasattr(param, "_is_initialized") or not param._is_initialized():
             return 0
-        try:
-            # Keep pinned-cache tensors as raw storage only; avoid tensor ops
-            # (e.g., slice/transpose) on cached tensors to prevent GPU fallback.
-            cpu_tensor = param._copy_to(self.cpu_place, True)
-        except Exception:
-            return 0
+        # Keep pinned-cache tensors as raw storage only; avoid tensor ops
+        # (e.g., slice/transpose) on cached tensors to prevent GPU fallback.
+        cpu_tensor = param._copy_to(self.cpu_place, True)
+
         layer_state.cpu_param_cache[param_id] = cpu_tensor
         cache_place = self._tensor_place_to_str(cpu_tensor)
         self.cache_tensor_place_counter[cache_place] = self.cache_tensor_place_counter.get(cache_place, 0) + 1
