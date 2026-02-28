@@ -32,6 +32,7 @@ from fastdeploy.config import (
     CacheConfig,
     DeviceConfig,
     EarlyStopConfig,
+    EPDConfig,
     EPLBConfig,
     ErnieArchitectures,
     FDConfig,
@@ -635,7 +636,7 @@ class PaddleDisWorkerProc:
     def graph_optimize_and_warm_up_model(self) -> None:
         self.worker.graph_optimize_and_warm_up_model()
         # reset cache_messager prefilled_step signal
-        if not envs.ENABLE_V1_KVCACHE_SCHEDULER and self.scheduler_config.splitwise_role == "prefill":
+        if not envs.ENABLE_V1_KVCACHE_SCHEDULER and self.scheduler_config.splitwise_role in ("prefill", "encoder"):
             gpu_id = self.worker.model_runner.device_id
             prefilled_step_name = f"splitwise_complete_prefilled_step_{self.local_rank}"
             prefilled_step_idx_data = np.zeros(shape=[1], dtype=np.int32)
@@ -786,6 +787,17 @@ def parse_args():
         help="disable sequence parallel moe",
     )
     parser.add_argument("--splitwise_role", type=str, default="mixed", help="splitwise role")
+    parser.add_argument("--epd_enable", action="store_true", help="enable EPD disaggregation")
+    parser.add_argument("--epd_shm_dir", type=str, default="/dev/shm", help="EPD shared memory directory")
+    parser.add_argument("--epd_shm_ttl_sec", type=int, default=120, help="EPD shm ttl seconds")
+    parser.add_argument(
+        "--epd_shm_max_bytes",
+        type=int,
+        default=4 * 1024**3,
+        help="EPD shm max bytes for one payload",
+    )
+    parser.add_argument("--epd_encoder_model", type=str, default="qwen2.5vl", help="EPD encoder model family")
+    parser.add_argument("--epd_node_role", type=str, default="", help="EPD node role")
     parser.add_argument(
         "--tensor_parallel_size",
         type=int,
@@ -1042,6 +1054,19 @@ def initialize_fd_config(args, ranks: int = 1, local_rank: int = 0) -> FDConfig:
         FDConfig: Initialized FastDeploy configuration object
     """
     # RL rollout
+    if args.splitwise_role == "encoder":
+        logger.info(
+            "[EPD][CFG] --splitwise_role=encoder is mapped to prefill-compatible runtime role in worker process."
+        )
+        args.splitwise_role = "prefill"
+        args.epd_enable = True
+        args.epd_node_role = "encoder"
+    elif args.epd_enable and args.epd_node_role == "":
+        if args.splitwise_role == "prefill":
+            args.epd_node_role = "encoder"
+        elif args.splitwise_role in ("mixed", "decode"):
+            args.epd_node_role = "pd"
+
     paddle.set_default_dtype(args.dtype)
     model_config = ModelConfig(vars(args))
     device_config = DeviceConfig(vars(args))
@@ -1085,6 +1110,7 @@ def initialize_fd_config(args, ranks: int = 1, local_rank: int = 0) -> FDConfig:
     early_stop_config = EarlyStopConfig(args.early_stop_config)
 
     structured_outputs_config: StructuredOutputsConfig = StructuredOutputsConfig(args=vars(args))
+    epd_config = EPDConfig(vars(args))
     routing_replay_config = RoutingReplayConfig(args.routing_replay_config)
 
     # Note(tangbinhan): used for load_checkpoint
@@ -1134,7 +1160,7 @@ def initialize_fd_config(args, ranks: int = 1, local_rank: int = 0) -> FDConfig:
         logger.info("Set ENABLE_V1_KVCACHE_SCHEDULER to 0 due to not supported.")
         envs.ENABLE_V1_KVCACHE_SCHEDULER = 0
 
-    if envs.ENABLE_V1_KVCACHE_SCHEDULER and args.splitwise_role == "prefill":
+    if envs.ENABLE_V1_KVCACHE_SCHEDULER and args.splitwise_role in ("prefill", "encoder"):
         os.environ["PREFILL_NODE_ONE_STEP_STOP_V1"] = "1"
     elif envs.ENABLE_V1_KVCACHE_SCHEDULER and args.splitwise_role == "decode":
         os.environ["PREFILL_NODE_ONE_STEP_STOP_V1"] = "0"
@@ -1153,6 +1179,7 @@ def initialize_fd_config(args, ranks: int = 1, local_rank: int = 0) -> FDConfig:
         ips=args.ips,
         plas_attention_config=plas_attention_config,
         structured_outputs_config=structured_outputs_config,
+        epd_config=epd_config,
         eplb_config=eplb_config,
         routing_replay_config=routing_replay_config,
     )

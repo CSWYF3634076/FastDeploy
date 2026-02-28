@@ -1644,6 +1644,42 @@ class RoutingReplayConfig:
         return json.dumps({key: value for key, value in self.__dict__.items()})
 
 
+class EPDConfig:
+    """
+    Configuration for EPD (Encoder + Prefill + Decode) disaggregation.
+
+    Note:
+        The current implementation only supports Qwen2.5VL in single-host mode.
+    """
+
+    def __init__(self, args: dict):
+        self.enable: bool = False
+        self.shm_dir: str = "/dev/shm"
+        self.shm_ttl_sec: int = 120
+        self.shm_max_bytes: int = 4 * 1024**3
+        self.encoder_model: str = "qwen2.5vl"
+        self.node_role: str = ""
+
+        # Read from engine args naming.
+        self.enable = bool(args.get("epd_enable", self.enable))
+        self.shm_dir = args.get("epd_shm_dir", self.shm_dir)
+        self.shm_ttl_sec = int(args.get("epd_shm_ttl_sec", self.shm_ttl_sec))
+        self.shm_max_bytes = int(args.get("epd_shm_max_bytes", self.shm_max_bytes))
+        self.encoder_model = str(args.get("epd_encoder_model", self.encoder_model)).lower()
+        self.node_role = str(args.get("epd_node_role", self.node_role)).lower()
+
+        if self.shm_ttl_sec <= 0:
+            raise ValueError(f"epd_shm_ttl_sec must be > 0, but got {self.shm_ttl_sec}")
+        if self.shm_max_bytes <= 0:
+            raise ValueError(f"epd_shm_max_bytes must be > 0, but got {self.shm_max_bytes}")
+
+    def print(self):
+        logger.info("EPD Configuration Information :")
+        for k, v in self.__dict__.items():
+            logger.info("{:<20}:{:<6}{}".format(k, "", v))
+        logger.info("=============================================================")
+
+
 class FDConfig:
     """
     The configuration class which contains all fastdeploy-related configuration. This
@@ -1666,6 +1702,7 @@ class FDConfig:
         eplb_config: EPLBConfig = None,
         structured_outputs_config: StructuredOutputsConfig = None,
         router_config: RouterConfig = None,
+        epd_config: Optional[EPDConfig] = None,
         tokenizer: str = None,
         ips: str = None,
         use_warmup: bool = False,
@@ -1694,6 +1731,7 @@ class FDConfig:
         self.plas_attention_config: Optional[PlasAttentionConfig] = plas_attention_config
         self.structured_outputs_config: StructuredOutputsConfig = structured_outputs_config
         self.router_config: RouterConfig = router_config
+        self.epd_config: EPDConfig = epd_config if epd_config is not None else EPDConfig({})
         self.routing_replay_config = routing_replay_config
 
         # Initialize cuda graph capture list
@@ -1882,7 +1920,7 @@ class FDConfig:
             self.cache_config.max_encoder_cache = 0
 
         # Adjustment GraphOptConfig
-        if self.scheduler_config is not None and self.scheduler_config.splitwise_role == "prefill":
+        if self.scheduler_config is not None and self.scheduler_config.splitwise_role in ["prefill", "encoder"]:
             self.graph_opt_config.use_cudagraph = self.graph_opt_config.cudagraph_only_prefill
         if self.load_config is not None and self.load_config.dynamic_load_weight is True:
             self.graph_opt_config.graph_opt_level = 0
@@ -1898,19 +1936,42 @@ class FDConfig:
 
         # adjust speculative config
         if self.speculative_config is not None and self.speculative_config.method == "mtp":
-            if self.scheduler_config.splitwise_role == "prefill":
+            if self.scheduler_config.splitwise_role in ["prefill", "encoder"]:
                 self.speculative_config.num_speculative_tokens = 1
                 self.speculative_config.num_model_steps = 1
 
         if self.scheduler_config.splitwise_role == "mixed":
             self._disable_sequence_parallel_moe_if_needed("Mixed")
             self.model_config.moe_phase = MoEPhase(phase="prefill")
-        elif self.scheduler_config.splitwise_role == "prefill":
+        elif self.scheduler_config.splitwise_role in ["prefill", "encoder"]:
             self.model_config.moe_phase = MoEPhase(phase="prefill")
         elif self.scheduler_config.splitwise_role == "decode":
             self.model_config.moe_phase = MoEPhase(phase="decode")
         else:
             raise NotImplementedError
+
+        if self.epd_config is not None and self.epd_config.enable:
+            if self.epd_config.node_role == "":
+                self.epd_config.node_role = (
+                    "encoder" if self.scheduler_config.splitwise_role in ["prefill", "encoder"] else "pd"
+                )
+            if not self.model_config.enable_mm:
+                raise ValueError("EPD requires multimodal model support, but current model is text-only.")
+            if self.epd_config.encoder_model != "qwen2.5vl":
+                raise NotImplementedError(
+                    f"Only epd_encoder_model=qwen2.5vl is supported now, but got {self.epd_config.encoder_model}."
+                )
+            if "qwen2_5_vl" not in self.model_config.model_type:
+                raise NotImplementedError(
+                    f"EPD currently supports Qwen2.5VL only, but got model_type={self.model_config.model_type}."
+                )
+            logger.info(
+                "[EPD][CFG] enabled, node_role=%s, shm_dir=%s, shm_ttl_sec=%s, shm_max_bytes=%s",
+                self.epd_config.node_role,
+                self.epd_config.shm_dir,
+                self.epd_config.shm_ttl_sec,
+                self.epd_config.shm_max_bytes,
+            )
 
         if self.parallel_config.use_sequence_parallel_moe and self.graph_opt_config.use_cudagraph:
             if self.scheduler_config.max_num_seqs < self.parallel_config.tensor_parallel_size:
@@ -1998,7 +2059,7 @@ class FDConfig:
             f"max_long_partial_prefills: {self.max_long_partial_prefills} should "
             f"be less than or equal to max_num_partial_prefills: {self.max_num_partial_prefills}"
         )
-        assert self.scheduler_config.splitwise_role in ["mixed", "prefill", "decode"]
+        assert self.scheduler_config.splitwise_role in ["mixed", "prefill", "decode", "encoder"]
 
         if not self.cache_config.enable_chunked_prefill:
             if not envs.ENABLE_V1_KVCACHE_SCHEDULER:
@@ -2088,6 +2149,7 @@ class FDConfig:
                 or k == "scheduler_config"
                 or k == "parallel_config"
                 or k == "commit_config"
+                or k == "epd_config"
             ):
                 if v is not None:
                     v.print()
@@ -2115,8 +2177,12 @@ class FDConfig:
         transfer_protocol = (
             self.cache_config.cache_transfer_protocol.split(",") if self.cache_config.cache_transfer_protocol else []
         )
+        role = self.scheduler_config.splitwise_role
+        if role == "encoder":
+            # Keep existing scheduler/router compatibility: treat encoder as a prefill-compatible role.
+            role = "prefill"
         self.register_info = {
-            "role": self.scheduler_config.splitwise_role,
+            "role": role,
             "host_ip": self.host_ip,
             "port": port,
             "metrics_port": metrics_port,

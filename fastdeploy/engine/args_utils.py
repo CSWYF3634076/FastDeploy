@@ -26,6 +26,7 @@ from fastdeploy.config import (
     CacheConfig,
     ConvertOption,
     EarlyStopConfig,
+    EPDConfig,
     EPLBConfig,
     FDConfig,
     GraphOptimizationConfig,
@@ -303,7 +304,32 @@ class EngineArgs:
 
     splitwise_role: str = "mixed"
     """
-    Splitwise role: prefill, decode or mixed
+    Splitwise role: prefill, decode, mixed or encoder(alias of prefill for EPD)
+    """
+
+    epd_enable: bool = False
+    """
+    Enable EPD (Encoder+Prefill+Decode) disaggregation.
+    """
+    epd_shm_dir: str = "/dev/shm"
+    """
+    Shared memory directory used by EPD data plane.
+    """
+    epd_shm_ttl_sec: int = 120
+    """
+    TTL (seconds) for EPD shared-memory blocks.
+    """
+    epd_shm_max_bytes: int = 4 * 1024**3
+    """
+    Maximum bytes for one EPD shared-memory payload.
+    """
+    epd_encoder_model: str = "qwen2.5vl"
+    """
+    EPD encoder model family. Current supported value: qwen2.5vl.
+    """
+    epd_node_role: str = ""
+    """
+    Internal EPD role label, populated during post-init.
     """
 
     data_parallel_size: int = 1
@@ -548,6 +574,19 @@ class EngineArgs:
 
         if not self.tokenizer:
             self.tokenizer = self.model
+        if self.splitwise_role == "encoder":
+            # Keep compatibility with existing prefill/decode scheduler pipeline.
+            console_logger.info(
+                "[EPD][CFG] --splitwise-role=encoder is mapped to prefill-compatible runtime role automatically."
+            )
+            self.splitwise_role = "prefill"
+            self.epd_enable = True
+            self.epd_node_role = "encoder"
+        elif self.epd_enable:
+            if self.splitwise_role == "prefill":
+                self.epd_node_role = "encoder"
+            elif self.splitwise_role in ("mixed", "decode"):
+                self.epd_node_role = "pd"
         if self.splitwise_role == "decode":
             self.enable_prefix_caching = False
         if (
@@ -1164,7 +1203,42 @@ class EngineArgs:
             type=str,
             default=EngineArgs.splitwise_role,
             help="Role of splitwise. Default is \
-            'mixed'. (prefill, decode, mixed)",
+            'mixed'. (prefill, decode, mixed, encoder)",
+        )
+
+        splitwise_group.add_argument(
+            "--epd-enable",
+            action=argparse.BooleanOptionalAction,
+            default=EngineArgs.epd_enable,
+            help="Enable EPD disaggregation (E->PD).",
+        )
+
+        splitwise_group.add_argument(
+            "--epd-shm-dir",
+            type=str,
+            default=EngineArgs.epd_shm_dir,
+            help="Shared memory directory used by EPD.",
+        )
+
+        splitwise_group.add_argument(
+            "--epd-shm-ttl-sec",
+            type=int,
+            default=EngineArgs.epd_shm_ttl_sec,
+            help="TTL (seconds) for EPD shared-memory blocks.",
+        )
+
+        splitwise_group.add_argument(
+            "--epd-shm-max-bytes",
+            type=int,
+            default=EngineArgs.epd_shm_max_bytes,
+            help="Maximum bytes for one EPD shared-memory payload.",
+        )
+
+        splitwise_group.add_argument(
+            "--epd-encoder-model",
+            type=str,
+            default=EngineArgs.epd_encoder_model,
+            help="EPD encoder model family. Current supported value: qwen2.5vl.",
         )
 
         splitwise_group.add_argument(
@@ -1385,6 +1459,13 @@ class EngineArgs:
         else:
             return PlasAttentionConfig(None)
 
+    def create_epd_config(self) -> EPDConfig:
+        """
+        Create and return an EPDConfig object based on the current settings.
+        """
+        epd_args = asdict(self)
+        return EPDConfig(epd_args)
+
     def create_early_stop_config(self) -> EarlyStopConfig:
         """
         Create and retuan an EarlyStopConfig object based on the current settings.
@@ -1454,6 +1535,7 @@ class EngineArgs:
         scheduler_cfg = self.create_scheduler_config()
         graph_opt_cfg = self.create_graph_optimization_config()
         plas_attention_config = self.create_plas_attention_config()
+        epd_config = self.create_epd_config()
         eplb_cfg = self.create_eplb_config()
         routing_replay_config = self.create_routing_repaly_config()
         router_config = RouterConfig(all_dict)
@@ -1473,6 +1555,7 @@ class EngineArgs:
             eplb_config=eplb_cfg,
             structured_outputs_config=structured_outputs_config,
             router_config=router_config,
+            epd_config=epd_config,
             ips=self.ips,
             use_warmup=self.use_warmup,
             limit_mm_per_prompt=self.limit_mm_per_prompt,

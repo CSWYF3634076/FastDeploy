@@ -184,6 +184,13 @@ class SplitwiseConnector:
             task.disaggregate_info["role"] = "decode"
             task.disaggregate_info["prefill_connector_port"] = self.cfg.cache_config.local_pd_comm_port
             addr = f"{task.disaggregate_info['decode_ip']}:{task.disaggregate_info['decode_connector_port']}"
+            if getattr(task, "vision_shm_refs", None):
+                self.logger.info(
+                    "[EPD][ROUTER] request_id=%s carries vision_shm_refs=%s to addr=%s",
+                    task.request_id,
+                    len(task.vision_shm_refs),
+                    addr,
+                )
             self.logger.info(f"send_splitwise_tasks: protocol=rdma, addr={addr}, task={task.request_id}")
             self._send_message(addr, "prefill", [task])
 
@@ -367,6 +374,13 @@ class SplitwiseConnector:
         """
         self.logger.debug(f"_handle_prefill: receive payload {tasks}")
         tasks_data = [Request.from_dict(task) for task in tasks]
+        for task in tasks_data:
+            if getattr(task, "vision_shm_refs", None):
+                self.logger.info(
+                    "[EPD][ROUTER] receive request_id=%s with vision_shm_refs=%s",
+                    task.request_id,
+                    len(task.vision_shm_refs),
+                )
         self.engine_worker_queue.put_disaggregated_tasks(("decode", tasks_data))
 
     def _handle_decode(self, payload):

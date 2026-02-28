@@ -89,6 +89,8 @@ class Request:
         pooling_params: Optional[PoolingParams] = None,
         multimodal_inputs: Optional[dict] = None,
         multimodal_data: Optional[dict] = None,
+        vision_shm_refs: Optional[list[dict]] = None,
+        vision_meta: Optional[dict] = None,
         disable_chat_template: bool = False,
         disaggregate_info: Optional[dict] = None,
         draft_token_ids: Optional[list[int]] = None,
@@ -161,6 +163,8 @@ class Request:
         self.multimodal_inputs = multimodal_inputs
         self.multimodal_data = multimodal_data
         self.multimodal_img_boundaries = None
+        self.vision_shm_refs = vision_shm_refs
+        self.vision_meta = vision_meta
 
         self.enable_thinking = enable_thinking
         self.reasoning_max_tokens = reasoning_max_tokens
@@ -365,6 +369,8 @@ class Request:
             eos_token_ids=d.get("eos_token_ids"),
             multimodal_inputs=d.get("multimodal_inputs"),
             multimodal_data=d.get("multimodal_data"),
+            vision_shm_refs=d.get("vision_shm_refs"),
+            vision_meta=d.get("vision_meta"),
             disable_chat_template=d.get("disable_chat_template"),
             disaggregate_info=d.get("disaggregate_info"),
             draft_token_ids=d.get("draft_token_ids"),
@@ -437,6 +443,8 @@ class Request:
             "tools": self.tools,
             "eos_token_ids": self.eos_token_ids,
             "multimodal_data": self.multimodal_data,
+            "vision_shm_refs": self.vision_shm_refs,
+            "vision_meta": self.vision_meta,
             "disable_chat_template": self.disable_chat_template,
             "disaggregate_info": self.disaggregate_info,
             "draft_token_ids": self.draft_token_ids,
@@ -463,6 +471,9 @@ class Request:
             # - V0 mode (ENABLE_V1_KVCACHE_SCHEDULER=0): Full field set required for compatibility
             # This filtering significantly reduces serialized data size for large numpy arrays
             allowed_keys = {"position_ids"}
+            if self.vision_shm_refs:
+                # EPD mode still needs structural MM fields on PD side.
+                allowed_keys.update(["grid_thw", "mm_positions", "mm_hashes"])
             if not envs.ENABLE_V1_KVCACHE_SCHEDULER:
                 allowed_keys.update(["input_ids", "token_type_ids", "images", "image_type_ids", "grid_thw"])
 

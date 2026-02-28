@@ -1946,6 +1946,13 @@ class EngineService:
         ips = None
         if self.cfg.ips is not None:
             ips = ",".join(self.cfg.ips)
+        epd_cfg = self.cfg.epd_config
+        epd_shm_dir = epd_cfg.shm_dir if epd_cfg is not None else "/dev/shm"
+        epd_shm_ttl_sec = epd_cfg.shm_ttl_sec if epd_cfg is not None else 120
+        epd_shm_max_bytes = epd_cfg.shm_max_bytes if epd_cfg is not None else 4 * 1024**3
+        epd_encoder_model = epd_cfg.encoder_model if epd_cfg is not None else "qwen2.5vl"
+        epd_node_role = epd_cfg.node_role if epd_cfg is not None else ""
+        epd_enable = epd_cfg.enable if epd_cfg is not None else False
         arguments = (
             f" --devices {self.cfg.parallel_config.device_ids} {py_script}"
             f" --max_num_seqs {self.cfg.scheduler_config.max_num_seqs} --max_model_len {self.cfg.model_config.max_model_len}"
@@ -1982,6 +1989,10 @@ class EngineService:
             f" --plas_attention_config '{self.cfg.plas_attention_config.to_json_string()}'"
             f" --ips {ips}"
             f" --cache-transfer-protocol {self.cfg.cache_config.cache_transfer_protocol}"
+            f" --epd_shm_dir {epd_shm_dir}"
+            f" --epd_shm_ttl_sec {epd_shm_ttl_sec}"
+            f" --epd_shm_max_bytes {epd_shm_max_bytes}"
+            f" --epd_encoder_model {epd_encoder_model}"
             f" --runner {self.cfg.model_config.runner}"
             f" --convert {self.cfg.model_config.convert}"
             f" --override-pooler-config {self.cfg.model_config.override_pooler_config}"
@@ -1994,6 +2005,8 @@ class EngineService:
             arguments += f" --logits-processors {' '.join(self.cfg.structured_outputs_config.logits_processors)}"
         if self.mm_max_tokens_per_item is not None:
             arguments += f" --mm_max_tokens_per_item '{json.dumps(self.mm_max_tokens_per_item)}'"
+        if epd_node_role:
+            arguments += f" --epd_node_role {epd_node_role}"
 
         worker_store_true_flag = {
             "enable_expert_parallel": self.cfg.parallel_config.enable_expert_parallel,
@@ -2009,6 +2022,7 @@ class EngineService:
             "lm_head_fp32": self.cfg.model_config.lm_head_fp32,
             "enable_entropy": self.cfg.model_config.enable_entropy,
             "enable_overlap_schedule": self.cfg.scheduler_config.enable_overlap_schedule,
+            "epd_enable": epd_enable,
         }
         for worker_flag, value in worker_store_true_flag.items():
             if value:

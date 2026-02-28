@@ -16,6 +16,7 @@
 
 from .engine_cache_queue import EngineCacheQueue
 from .engine_worker_queue import EngineWorkerQueue
+from .epd_shm_manager import EPDShmManager
 from .ipc_signal import IPCSignal, shared_memory_exists
 from .ipc_signal_const import (
     ExistTaskStatus,
@@ -34,6 +35,7 @@ __all__ = [
     "IPCSignal",
     "EngineWorkerQueue",
     "EngineCacheQueue",
+    "EPDShmManager",
     "shared_memory_exists",
     "ExistTaskStatus",
     "PrefixTreeStatus",

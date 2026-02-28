@@ -95,7 +95,7 @@ import zmq
 from fastdeploy import envs
 from fastdeploy.engine.tasks import PoolingTask
 from fastdeploy.input.ernie4_5_vl_processor import DataProcessor
-from fastdeploy.inter_communicator import IPCSignal, ZmqIpcClient
+from fastdeploy.inter_communicator import EPDShmManager, IPCSignal, ZmqIpcClient
 from fastdeploy.model_executor.forward_meta import ForwardMeta
 from fastdeploy.model_executor.layers.pool.metadata import PoolingMetadata
 from fastdeploy.model_executor.models.ernie4_5_vl.modeling_resampler import ScatterOp
@@ -121,6 +121,23 @@ class GPUModelRunner(ModelRunnerBase):
         super().__init__(fd_config=fd_config, device=device)
         self.MAX_INFER_SEED = 9223372036854775806
         self.enable_mm = self.model_config.enable_mm
+        self.epd_config = getattr(self.fd_config, "epd_config", None)
+        self.enable_epd = bool(self.epd_config is not None and self.epd_config.enable)
+        self.epd_node_role = self.epd_config.node_role if self.epd_config is not None else ""
+        self.epd_shm_manager: Optional[EPDShmManager] = None
+        if self.enable_epd:
+            self.epd_shm_manager = EPDShmManager(
+                shm_dir=self.epd_config.shm_dir,
+                ttl_sec=self.epd_config.shm_ttl_sec,
+                max_bytes=self.epd_config.shm_max_bytes,
+                name_prefix=f"fd_epd_{self.parallel_config.local_engine_worker_queue_port}",
+            )
+            logger.info(
+                "[EPD][CFG] enabled on worker "
+                f"rank={rank} local_rank={local_rank} "
+                f"role={self.epd_node_role or 'unknown'} "
+                f"model={self.epd_config.encoder_model}"
+            )
         self.rank = rank
         self.local_rank = local_rank
         self.device_id = device_id
@@ -415,6 +432,84 @@ class GPUModelRunner(ModelRunnerBase):
             schemata_key,
         )
 
+    def _is_epd_qwen25_active(self) -> bool:
+        return self.enable_epd and self.enable_mm and "qwen2_5_vl" in self.model_config.model_type
+
+    def _try_load_epd_mm_features(self, request: Request, idx: int) -> bool:
+        if not self._is_epd_qwen25_active() or self.epd_shm_manager is None:
+            return False
+        refs = getattr(request, "vision_shm_refs", None)
+        if not refs:
+            return False
+
+        loaded_feats: list[paddle.Tensor] = []
+        for ref in refs:
+            try:
+                payload = self.epd_shm_manager.load_numpy(ref)
+                if payload is None:
+                    logger.error(f"[EPD][PD] load shm payload failed, request_id={request.request_id} ref={ref}")
+                    return False
+                feature = paddle.to_tensor(payload)
+                paddle_dtype = ref.get("paddle_dtype")
+                if paddle_dtype is not None:
+                    feature_dtype = str(feature.dtype).replace("paddle.", "")
+                    if feature_dtype != paddle_dtype:
+                        feature = feature.cast(paddle_dtype)
+                loaded_feats.append(feature.to(self.device))
+            except Exception as e:
+                logger.error(
+                    f"[EPD][PD] load shm payload exception, request_id={request.request_id} ref={ref} err={e}"
+                )
+                return False
+
+        if not loaded_feats:
+            return False
+        merged = paddle.concat(loaded_feats, axis=0) if len(loaded_feats) > 1 else loaded_feats[0]
+        self.share_inputs["image_features_list"][idx] = merged
+        logger.info(
+            "[EPD][PD] loaded image features from shm, "
+            f"request_id={request.request_id} refs={len(refs)} "
+            f"shape={tuple(merged.shape)} dtype={str(merged.dtype)}"
+        )
+        return True
+
+    def _dump_epd_mm_features(self, request: Request, idx: int) -> None:
+        if not self._is_epd_qwen25_active() or self.epd_shm_manager is None:
+            return
+        if self.epd_node_role != "encoder":
+            return
+        if getattr(request, "vision_shm_refs", None):
+            return
+
+        feat = self.share_inputs["image_features_list"][idx]
+        if not isinstance(feat, paddle.Tensor):
+            return
+
+        feature_cpu = feat.cpu()
+        paddle_dtype = str(feature_cpu.dtype).replace("paddle.", "")
+        if paddle_dtype == "bfloat16":
+            # numpy does not have a stable bfloat16 dtype across environments.
+            payload = feature_cpu.cast("float16").numpy()
+        else:
+            payload = feature_cpu.numpy()
+
+        try:
+            ref = self.epd_shm_manager.dump_numpy(request_id=request.request_id, array=payload, chunk_id=0)
+            ref["paddle_dtype"] = paddle_dtype
+            request.vision_shm_refs = [ref]
+            request.vision_meta = {
+                "mode": "epd_shm",
+                "num_refs": 1,
+                "model_type": self.model_config.model_type,
+            }
+            logger.info(
+                "[EPD][E] dumped image features to shm, "
+                f"request_id={request.request_id} shm_name={ref.get('name')} "
+                f"nbytes={ref.get('nbytes')} paddle_dtype={paddle_dtype}"
+            )
+        except Exception as e:
+            logger.error(f"[EPD][E] dump image features to shm failed, request_id={request.request_id}, err={e}")
+
     def _process_mm_features(self, request_list: List[Request]):
         """
         Process and cache vision features from model
@@ -466,6 +561,10 @@ class GPUModelRunner(ModelRunnerBase):
                 rope_3d_position_ids["max_tokens_lst"].append(0)
             else:
                 rope_3d_position_ids["max_tokens_lst"].append(request.get("max_tokens", 2048))
+
+            if request.with_image and self._try_load_epd_mm_features(request, idx):
+                # EPD path: image features are already generated by encoder node.
+                continue
 
             if request.with_image:
                 req_idx_img_index_map[idx] = img_index
@@ -645,6 +744,15 @@ class GPUModelRunner(ModelRunnerBase):
             )
             for i, idx in enumerate(rope_3d_position_ids["position_ids_idx"]):
                 self.share_inputs["rope_emb"][idx : idx + 1, :] = rope_3d_lst[i]
+
+        if self._is_epd_qwen25_active() and self.epd_node_role == "encoder":
+            for request in request_list:
+                if request.task_type.value != RequestType.PREFILL.value:
+                    continue
+                if not getattr(request, "with_image", False):
+                    continue
+                idx = self.share_inputs.get_index_by_batch_id(request.idx)
+                self._dump_epd_mm_features(request, idx)
 
     def _get_feature_positions(
         self, mm_positions: List[ImagePosition], prefill_start_index: int, prefill_end_index: int
